@@ -1,0 +1,29 @@
+From 0d26874070a821102adafbec55ccdbb7aea9762f Mon Sep 17 00:00:00 2001
+From: WWE13 Recomp <wwe13-recomp@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 18:36:51 +0000
+Subject: [PATCH] tests: run the rexglue test generator through
+ CMAKE_CROSSCOMPILING_EMULATOR
+
+Cross builds (e.g. Linux ARM64 from x86-64) produce a target-arch rexglue
+that the host cannot execute directly; prefix the emulator (empty on native
+builds, so nothing changes there).
+---
+ tests/ppc/CMakeLists.txt | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/tests/ppc/CMakeLists.txt b/tests/ppc/CMakeLists.txt
+index ecf957d..3714774 100644
+--- a/tests/ppc/CMakeLists.txt
++++ b/tests/ppc/CMakeLists.txt
+@@ -142,7 +142,7 @@ add_custom_command(
+     OUTPUT ${CMAKE_BINARY_DIR}/tests/ppc/generated/ppc_test_functions.cpp
+            ${CMAKE_BINARY_DIR}/tests/ppc/generated/ppc_test_cases.cpp
+            ${CMAKE_BINARY_DIR}/tests/ppc/generated/ppc_test_decls.h
+-    COMMAND $<TARGET_FILE:rexglue> recompile-tests
++    COMMAND ${CMAKE_CROSSCOMPILING_EMULATOR} $<TARGET_FILE:rexglue> recompile-tests
+             --output=${CMAKE_BINARY_DIR}/tests/ppc/generated
+             --bin_dir=${CMAKE_BINARY_DIR}/tests/ppc/bin
+             --asm_dir=${CMAKE_CURRENT_SOURCE_DIR}/asm
+-- 
+2.43.0
+

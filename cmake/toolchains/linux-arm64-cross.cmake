@@ -1,0 +1,23 @@
+# Cross-compile ReXGlue / WWE '13 Recomp for Linux ARM64 from an x86-64 Linux host.
+# Needs clang, lld, g++-aarch64-linux-gnu (for libstdc++/glibc) and the :arm64 dev packages
+# (libgtk-3-dev:arm64, libx11-xcb-dev:arm64). See docs/PORTING-ARM64.md.
+set(CMAKE_SYSTEM_NAME Linux)
+set(CMAKE_SYSTEM_PROCESSOR aarch64)
+set(triple aarch64-linux-gnu)
+set(CMAKE_C_COMPILER clang)
+set(CMAKE_CXX_COMPILER clang++)
+set(CMAKE_ASM_COMPILER clang)
+set(CMAKE_C_COMPILER_TARGET ${triple})
+set(CMAKE_CXX_COMPILER_TARGET ${triple})
+set(CMAKE_ASM_COMPILER_TARGET ${triple})
+set(CMAKE_EXE_LINKER_FLAGS_INIT "-fuse-ld=lld")
+set(CMAKE_SHARED_LINKER_FLAGS_INIT "-fuse-ld=lld")
+set(CMAKE_MODULE_LINKER_FLAGS_INIT "-fuse-ld=lld")
+set(CMAKE_FIND_ROOT_PATH /usr/${triple} /usr/lib/${triple})
+set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
+set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)
+set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE BOTH)
+set(CMAKE_FIND_ROOT_PATH_MODE_PACKAGE BOTH)
+set(CMAKE_CROSSCOMPILING_EMULATOR qemu-aarch64 -L /usr/${triple})
+set(ENV{PKG_CONFIG_LIBDIR} "/usr/lib/${triple}/pkgconfig:/usr/share/pkgconfig")
+set(ENV{PKG_CONFIG_SYSROOT_DIR} "")
