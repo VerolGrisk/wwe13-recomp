@@ -1,0 +1,46 @@
+From 1f15827a21fdf52a58bb43c94faa562b24ec450d Mon Sep 17 00:00:00 2001
+From: WWE13-Recomp <wwe13-recomp@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 19:09:48 +0000
+Subject: [PATCH 102/103] tests: build on ARM64
+
+- mmio_handler_test: check pc instead of rip on ARM64
+- ppc_tests: pass -msse4.1/-mssse3 only on x86-64 (clang rejects them for aarch64)
+---
+ tests/ppc/CMakeLists.txt                | 4 +++-
+ tests/unit/system/mmio_handler_test.cpp | 4 ++++
+ 2 files changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/tests/ppc/CMakeLists.txt b/tests/ppc/CMakeLists.txt
+index 3714774..4861d5a 100644
+--- a/tests/ppc/CMakeLists.txt
++++ b/tests/ppc/CMakeLists.txt
+@@ -199,7 +199,9 @@ set_target_properties(ppc_tests PROPERTIES
+ )
+ 
+ # Enable SSE4.1 for vector intrinsics used in generated code
+-target_compile_options(ppc_tests PRIVATE -msse4.1 -mssse3)
++if(CMAKE_SYSTEM_PROCESSOR MATCHES "AMD64|x86_64")
++    target_compile_options(ppc_tests PRIVATE -msse4.1 -mssse3)
++endif()
+ 
+ include(Catch)
+ 
+diff --git a/tests/unit/system/mmio_handler_test.cpp b/tests/unit/system/mmio_handler_test.cpp
+index 8eb13a8..a2734bb 100644
+--- a/tests/unit/system/mmio_handler_test.cpp
++++ b/tests/unit/system/mmio_handler_test.cpp
+@@ -615,7 +615,11 @@ TEST_CASE("MMIO execute: a miss falls through to the access-violation callback",
+   CHECK(av_state.calls == 1);
+   CHECK(av_state.host_address == reinterpret_cast<void*>(fault));
+   CHECK_FALSE(av_state.is_write);
++#if REX_ARCH_AMD64
+   CHECK(context.rip == 0);  // no instruction was executed
++#elif REX_ARCH_ARM64
++  CHECK(context.pc == 0);  // no instruction was executed
++#endif
+ 
+   CHECK(munmap(page, 4096) == 0);
+ }
+-- 
+2.43.0
+

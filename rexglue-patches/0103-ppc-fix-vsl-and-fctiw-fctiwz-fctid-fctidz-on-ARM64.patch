@@ -1,0 +1,205 @@
+From f85968ef17938581ee3c7deb08519091ac1c435f Mon Sep 17 00:00:00 2001
+From: WWE13-Recomp <wwe13-recomp@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 19:09:48 +0000
+Subject: [PATCH 103/103] ppc: fix vsl and fctiw/fctiwz/fctid/fctidz on ARM64
+
+vsl: the ARM64 branch passed a positive count to vshlq_u64 for the carry
+(a left shift instead of a right shift), so bits from the other lane were
+corrupted (test_vsl_1..4). Use one SIMDe path with variable-count shifts.
+
+fcti*: the generated code relied on x86 cvt(t)sd2si. SIMDe's portable
+fallbacks (used on ARM64) return INT32_MIN for exactly INT32_MAX
+(test_fctiwz_8) and round halves away from zero instead of using the
+current rounding mode. Emit rex::ppc_fcti* helpers that implement the
+PowerPC saturation rules and round with std::nearbyint (host rounding mode,
+which the FPSCR emulation programs). This also makes fctidz(2^63) saturate
+to INT64_MAX on x86-64.
+
+New tests: instr_fctix_rounding.s (half-even rounding, INT32_MAX, 2^63).
+---
+ include/rex/ppc/memory.h                | 61 +++++++++++--------------
+ src/codegen/builders/floating_point.cpp | 16 ++-----
+ tests/ppc/asm/instr_fctix_rounding.s    | 42 +++++++++++++++++
+ 3 files changed, 72 insertions(+), 47 deletions(-)
+ create mode 100644 tests/ppc/asm/instr_fctix_rounding.s
+
+diff --git a/include/rex/ppc/memory.h b/include/rex/ppc/memory.h
+index f03fc2f..c5cc900 100644
+--- a/include/rex/ppc/memory.h
++++ b/include/rex/ppc/memory.h
+@@ -458,50 +458,41 @@ inline simde__m128i simde_mm_vsr(simde__m128i a, simde__m128i b) {
+       simde_mm_castsi128_ps(simde_mm_srl_epi64(simde_mm_srli_si128(a, 4), b)), 0x10));
+ }
+ 
++// PowerPC fctiw/fctiwz/fctid/fctidz for non-NaN inputs, without relying on host conversion quirks.
++// x86 cvt(t)sd2si returns the "integer indefinite" value on overflow and the recompiled code patched
++// around that; SIMDe's portable fallbacks (used on ARM64) differ at the edges (exactly INT32_MAX became
++// INT32_MIN) and round halves away from zero instead of honouring the current rounding mode.
++// Callers handle NaN themselves. The rounding variants use std::nearbyint, i.e. the host rounding mode
++// that the FPSCR emulation programs (MXCSR on x86-64, FPCR on ARM64).
++inline int64_t ppc_f64_to_s32_sat(double v) noexcept {
++  if (!(v > -2147483649.0)) return INT32_MIN;  // sign-extended, as cvttsd2si's result was
++  if (!(v < 2147483648.0)) return INT32_MAX;
++  return int32_t(v);  // truncates toward zero
++}
++inline int64_t ppc_f64_to_s64_sat(double v) noexcept {
++  if (!(v >= -9223372036854775808.0)) return INT64_MIN;
++  if (!(v < 9223372036854775808.0)) return INT64_MAX;
++  return int64_t(v);
++}
++inline int64_t ppc_fctiwz(double v) noexcept { return ppc_f64_to_s32_sat(v); }
++inline int64_t ppc_fctiw(double v) noexcept { return ppc_f64_to_s32_sat(std::nearbyint(v)); }
++inline int64_t ppc_fctidz(double v) noexcept { return ppc_f64_to_s64_sat(v); }
++inline int64_t ppc_fctid(double v) noexcept { return ppc_f64_to_s64_sat(std::nearbyint(v)); }
++
+ // Vector Shift Left - shift entire 128-bit vector left by bits in low 3 bits of b
+ inline simde__m128i simde_mm_vsl(simde__m128i a, simde__m128i b) {
+   int shift = simde_mm_extract_epi8(b, 15) & 0x7;  // Get low 3 bits from byte 15 (BE: byte 0)
+   if (shift == 0)
+     return a;
+ 
+-#if defined(__x86_64__) || defined(_M_X64)
+-  // Split into high and low 64-bit parts
+-  simde__m128i low_shifted = simde_mm_slli_epi64(a, shift);
+-  simde__m128i high_carry = simde_mm_srli_epi64(a, 64 - shift);
++  // Split into high and low 64-bit parts. SIMDe lowers this to NEON on ARM64; the former hand-written
++  // ARM64 branch passed a positive count to vshlq_u64 for the carry (a left shift), corrupting the result.
++  // Variable-count forms: the immediate forms (slli/srli) need a compile-time count on ARM64.
++  simde__m128i low_shifted = simde_mm_sll_epi64(a, simde_mm_cvtsi32_si128(shift));
++  simde__m128i high_carry = simde_mm_srl_epi64(a, simde_mm_cvtsi32_si128(64 - shift));
+   // Shift the carry from low qword to high qword position
+   high_carry = simde_mm_slli_si128(high_carry, 8);
+   return simde_mm_or_si128(low_shifted, high_carry);
+-#elif defined(__aarch64__) || defined(_M_ARM64)
+-  // ARM64 NEON implementation using vld1/vst1 for conversion
+-  uint64_t vals[2];
+-  uint64_t res[2] = {0, 0};
+-
+-  // Store simde__m128i to memory
+-  simde_mm_store_si128((simde__m128i*)vals, a);
+-
+-  // Load as NEON vector
+-  uint64x2_t va = vld1q_u64(vals);
+-
+-  // vshlq_u64 accepts variable shift per lane
+-  int64x2_t shift_vector = vdupq_n_s64(shift);
+-  uint64x2_t low_shifted = vshlq_u64(va, shift_vector);
+-
+-  // For the carry, we need right shift
+-  int64x2_t rshift_vector = vdupq_n_s64(64 - shift);
+-  uint64x2_t high_carry = vshlq_u64(va, rshift_vector);
+-
+-  // Combine results
+-  uint64x2_t result_vec = vdupq_n_u64(0);
+-  result_vec = vsetq_lane_u64(vgetq_lane_u64(low_shifted, 0), result_vec, 0);
+-  result_vec =
+-      vsetq_lane_u64(vgetq_lane_u64(low_shifted, 1) | vgetq_lane_u64(high_carry, 0), result_vec, 1);
+-
+-  // Store back to memory and reload as simde__m128i
+-  vst1q_u64(res, result_vec);
+-  return simde_mm_load_si128((simde__m128i*)res);
+-#else
+-#error "Unsupported architecture for simde_mm_vsl (only x86_64 and ARM64 supported)"
+-#endif
+ }
+ 
+ // Vector Shift Left by Octet - shift entire vector left by bytes in bits [121:124] of vB
+diff --git a/src/codegen/builders/floating_point.cpp b/src/codegen/builders/floating_point.cpp
+index 5b3dfa9..e972537 100644
+--- a/src/codegen/builders/floating_point.cpp
++++ b/src/codegen/builders/floating_point.cpp
+@@ -59,9 +59,7 @@ bool build_fcfid(BuilderContext& ctx) {
+ bool build_fctid(BuilderContext& ctx) {
+   ctx.emit_set_flush_mode(false);
+   ctx.println(
+-      "\t{0}.s64 = std::isnan({1}.f64) ? int64_t(0x8000000000000000ULL) : "
+-      "({1}.f64 > double(LLONG_MAX)) ? LLONG_MAX : "
+-      "simde_mm_cvtsd_si64(simde_mm_load_sd(&{1}.f64));",
++      "\t{0}.s64 = std::isnan({1}.f64) ? int64_t(0x8000000000000000ULL) : rex::ppc_fctid({1}.f64);",
+       ctx.f(ctx.insn.operands[0]), ctx.f(ctx.insn.operands[1]));
+   return true;
+ }
+@@ -69,9 +67,7 @@ bool build_fctid(BuilderContext& ctx) {
+ bool build_fctidz(BuilderContext& ctx) {
+   ctx.emit_set_flush_mode(false);
+   ctx.println(
+-      "\t{0}.s64 = std::isnan({1}.f64) ? int64_t(0x8000000000000000ULL) : "
+-      "({1}.f64 > double(LLONG_MAX)) ? LLONG_MAX : "
+-      "simde_mm_cvttsd_si64(simde_mm_load_sd(&{1}.f64));",
++      "\t{0}.s64 = std::isnan({1}.f64) ? int64_t(0x8000000000000000ULL) : rex::ppc_fctidz({1}.f64);",
+       ctx.f(ctx.insn.operands[0]), ctx.f(ctx.insn.operands[1]));
+   return true;
+ }
+@@ -79,9 +75,7 @@ bool build_fctidz(BuilderContext& ctx) {
+ bool build_fctiw(BuilderContext& ctx) {
+   ctx.emit_set_flush_mode(false);
+   ctx.println(
+-      "\t{0}.s64 = std::isnan({1}.f64) ? int64_t(0x80000000U) : "
+-      "({1}.f64 > double(INT_MAX)) ? INT_MAX : "
+-      "simde_mm_cvtsd_si32(simde_mm_load_sd(&{1}.f64));",
++      "\t{0}.s64 = std::isnan({1}.f64) ? int64_t(0x80000000U) : rex::ppc_fctiw({1}.f64);",
+       ctx.f(ctx.insn.operands[0]), ctx.f(ctx.insn.operands[1]));
+   return true;
+ }
+@@ -89,9 +83,7 @@ bool build_fctiw(BuilderContext& ctx) {
+ bool build_fctiwz(BuilderContext& ctx) {
+   ctx.emit_set_flush_mode(false);
+   ctx.println(
+-      "\t{0}.s64 = std::isnan({1}.f64) ? int64_t(0x80000000U) : "
+-      "({1}.f64 > double(INT_MAX)) ? INT_MAX : "
+-      "simde_mm_cvttsd_si32(simde_mm_load_sd(&{1}.f64));",
++      "\t{0}.s64 = std::isnan({1}.f64) ? int64_t(0x80000000U) : rex::ppc_fctiwz({1}.f64);",
+       ctx.f(ctx.insn.operands[0]), ctx.f(ctx.insn.operands[1]));
+   return true;
+ }
+diff --git a/tests/ppc/asm/instr_fctix_rounding.s b/tests/ppc/asm/instr_fctix_rounding.s
+new file mode 100644
+index 0000000..71420b9
+--- /dev/null
++++ b/tests/ppc/asm/instr_fctix_rounding.s
+@@ -0,0 +1,42 @@
++# fctiw/fctid round with the current rounding mode (round-to-nearest-even by default) and saturate at
++# the destination range. Regression tests for host-independent conversion (x86-64 and ARM64).
++
++# 2.5 rounds to even: 2
++test_fctiw_round_half_even_1:
++  #_ REGISTER_IN f0 0x4004000000000000
++  fctiw f1, f0
++  blr
++  #_ REGISTER_OUT f0 0x4004000000000000
++  #_ REGISTER_OUT f1 0x0000000000000002
++
++# 3.5 rounds to even: 4
++test_fctiw_round_half_even_2:
++  #_ REGISTER_IN f0 0x400c000000000000
++  fctiw f1, f0
++  blr
++  #_ REGISTER_OUT f0 0x400c000000000000
++  #_ REGISTER_OUT f1 0x0000000000000004
++
++# exactly INT32_MAX (2147483647.0) is in range
++test_fctiw_int32_max:
++  #_ REGISTER_IN f0 0x41dfffffffc00000
++  fctiw f1, f0
++  blr
++  #_ REGISTER_OUT f0 0x41dfffffffc00000
++  #_ REGISTER_OUT f1 0x000000007fffffff
++
++# 2.5 rounds to even: 2
++test_fctid_round_half_even:
++  #_ REGISTER_IN f0 0x4004000000000000
++  fctid f1, f0
++  blr
++  #_ REGISTER_OUT f0 0x4004000000000000
++  #_ REGISTER_OUT f1 0x0000000000000002
++
++# 2^63 saturates to INT64_MAX
++test_fctidz_two_pow_63:
++  #_ REGISTER_IN f0 0x43e0000000000000
++  fctidz f1, f0
++  blr
++  #_ REGISTER_OUT f0 0x43e0000000000000
++  #_ REGISTER_OUT f1 0x7fffffffffffffff
+-- 
+2.43.0
+
