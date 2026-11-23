@@ -28,6 +28,20 @@
 #include <psapi.h>
 #include <winreg.h>
 #include <winternl.h>
+#elif defined(__APPLE__)
+// macOS / iOS: system details come from sysctl; the crash handler reads Darwin's signal context.
+#include <dlfcn.h>
+#include <execinfo.h>
+#include <fcntl.h>
+#include <pthread.h>
+#include <signal.h>
+#include <sys/sysctl.h>
+#include <sys/types.h>
+#include <sys/utsname.h>
+#include <poll.h>
+#include <unistd.h>
+#include <mach/thread_status.h>
+#include <sys/ucontext.h>
 #else
 #include <dlfcn.h>
 #include <execinfo.h>
@@ -96,6 +110,21 @@ std::string ReadFirstMatchingLine(const char* path, std::string_view key) {
   return "unknown";
 }
 
+#if defined(__APPLE__)
+std::string SysctlString(const char* name) {
+  std::size_t size = 0;
+  if (sysctlbyname(name, nullptr, &size, nullptr, 0) != 0 || size == 0) {
+    return "unknown";
+  }
+  std::string value(size, '\0');
+  if (sysctlbyname(name, value.data(), &size, nullptr, 0) != 0) {
+    return "unknown";
+  }
+  value.resize(std::strlen(value.c_str()));
+  return value.empty() ? "unknown" : value;
+}
+#endif
+
 std::string CpuName() {
 #ifdef _WIN32
   HKEY key = nullptr;
@@ -122,6 +151,8 @@ std::string CpuName() {
   WideCharToMultiByte(CP_UTF8, 0, value.data(), -1, utf8.data(), utf8_size, nullptr, nullptr);
   utf8.resize(static_cast<std::size_t>(utf8_size - 1));
   return utf8;
+#elif defined(__APPLE__)
+  return SysctlString("machdep.cpu.brand_string");  // e.g. "Apple M2"
 #else
   return ReadFirstMatchingLine("/proc/cpuinfo", "model name");
 #endif
@@ -142,6 +173,16 @@ std::string OsVersion() {
   return "Windows " + std::to_string(version.dwMajorVersion) + "." +
          std::to_string(version.dwMinorVersion) + " build " +
          std::to_string(version.dwBuildNumber);
+#elif defined(__APPLE__)
+  struct utsname info {};
+  std::string version = "macOS " + SysctlString("kern.osproductversion");
+#if defined(TARGET_OS_IOS) && TARGET_OS_IOS
+  version = "iOS " + SysctlString("kern.osproductversion");
+#endif
+  if (uname(&info) == 0) {
+    return version + " (Darwin " + info.release + ", " + SysctlString("hw.model") + ")";
+  }
+  return version;
 #else
   const std::string pretty = ReadFirstMatchingLine("/etc/os-release", "PRETTY_NAME");
   struct utsname info {};
@@ -161,6 +202,21 @@ std::string CoreCountAndRam() {
   const std::uint64_t total_ram = GlobalMemoryStatusEx(&memory) ? memory.ullTotalPhys : 0;
   return std::to_string(system_info.dwNumberOfProcessors) + " cores, " +
          std::to_string(total_ram / (1024 * 1024)) + " MiB RAM";
+#elif defined(__APPLE__)
+  const long cores = sysconf(_SC_NPROCESSORS_ONLN);
+  std::uint64_t total_ram = 0;
+  std::size_t size = sizeof(total_ram);
+  if (sysctlbyname("hw.memsize", &total_ram, &size, nullptr, 0) != 0) {
+    total_ram = 0;
+  }
+  int performance_cores = 0;
+  size = sizeof(performance_cores);
+  std::string core_text = std::to_string(cores > 0 ? cores : 0) + " cores";
+  if (sysctlbyname("hw.perflevel0.physicalcpu", &performance_cores, &size, nullptr, 0) == 0 &&
+      performance_cores > 0) {
+    core_text += " (" + std::to_string(performance_cores) + " performance)";
+  }
+  return core_text + ", " + std::to_string(total_ram / (1024 * 1024)) + " MiB RAM";
 #else
   const long cores = sysconf(_SC_NPROCESSORS_ONLN);
   struct sysinfo memory {};
@@ -202,6 +258,8 @@ std::string PowerState() {
                : "battery " + std::to_string(status.BatteryLifePercent) + "%";
   }
   return "AC";
+#elif defined(__APPLE__)
+  return "unknown";  // IOKit power sources not queried yet
 #else
   try {  // directory iteration can throw on increment; a log line must never stop the game
   std::vector<std::string> battery_capacities;
@@ -555,6 +613,15 @@ std::size_t AppendAddress(char* output, std::size_t offset, std::size_t capacity
   return offset;
 }
 
+#if defined(__APPLE__)
+// Runs on the crashing thread: Darwin keeps the name in the thread itself (no /proc).
+void SignalSafeThreadName(char (&name)[16], pid_t thread_id) {
+  (void)thread_id;
+  if (pthread_getname_np(pthread_self(), name, sizeof(name)) != 0 || !name[0]) {
+    for (std::size_t i = 0; i < sizeof("unknown"); ++i) name[i] = "unknown"[i];
+  }
+}
+#else
 void SignalSafeThreadName(char (&name)[16], pid_t thread_id) {
   constexpr char prefix[] = "/proc/self/task/";
   char path[64];
@@ -590,12 +657,16 @@ void SignalSafeThreadName(char (&name)[16], pid_t thread_id) {
     }
   }
 }
+#endif
 
 std::uintptr_t HostProgramCounter(void* signal_context) {
   if (!signal_context) {
     return 0;
   }
-#if defined(__x86_64__) && defined(REG_RIP)
+#if defined(__APPLE__) && defined(__aarch64__)
+  const auto* context = static_cast<const ucontext_t*>(signal_context);
+  return reinterpret_cast<std::uintptr_t>(arm_thread_state64_get_pc(context->uc_mcontext->__ss));
+#elif defined(__x86_64__) && defined(REG_RIP)
   const auto* context = static_cast<const ucontext_t*>(signal_context);
   return static_cast<std::uintptr_t>(context->uc_mcontext.gregs[REG_RIP]);
 #elif defined(__aarch64__)
@@ -813,7 +884,15 @@ void CrashSignalHandler(int signal_number, siginfo_t* signal_info, void* signal_
                             ? reinterpret_cast<std::uintptr_t>(signal_info->si_addr)
                             : 0;
   event.host_pc = HostProgramCounter(signal_context);
+#if defined(__APPLE__)
+  {
+    std::uint64_t darwin_thread_id = 0;
+    pthread_threadid_np(nullptr, &darwin_thread_id);
+    event.thread_id = static_cast<pid_t>(darwin_thread_id);
+  }
+#else
   event.thread_id = static_cast<pid_t>(syscall(SYS_gettid));
+#endif
   SignalSafeThreadName(event.thread_name, event.thread_id);
   // The reporter thread flushes the normal spdlog sinks outside signal context and then silences
   // them. This must happen BEFORE the report is written: the log sink writes at its own file

@@ -1,0 +1,90 @@
+# Build check for the Apple silicon port (docs/PORTING-ARM64.md): builds the patched ReXGlue SDK on
+# a macOS arm64 runner with Xcode's compiler and runs the unit tests and the PowerPC instruction
+# tests natively. No game files are involved (the game itself is built locally from your own XEX).
+#
+# macOS runner minutes count 10x against a private repository's Actions allowance, so this only runs
+# when the port's files change on the port branch, or when started by hand.
+name: macOS port build check
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [claude/cool-faraday-gb7tcq]
+    paths:
+      - rexglue-patches/**
+      - tools/setup-macos.sh
+      - .github/workflows/macos-port.yml
+
+concurrency:
+  group: macos-port-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  sdk:
+    runs-on: macos-15
+    timeout-minutes: 150
+    env:
+      BINUTILS_VERSION: "2.42"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Tools
+        run: |
+          brew install ninja
+          xcodebuild -version
+          xcrun clang++ --version
+          cmake --version
+
+      # powerpc-none-elf as/ld/nm for the instruction tests (the SDK only ships Linux/Windows builds).
+      - name: Cache PowerPC binutils
+        id: binutils-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/ppc-binutils
+          key: ppc-binutils-${{ env.BINUTILS_VERSION }}-macos-arm64
+
+      - name: Build PowerPC binutils
+        if: steps.binutils-cache.outputs.cache-hit != 'true'
+        run: |
+          cd "$RUNNER_TEMP"
+          curl -fsSLO "https://ftpmirror.gnu.org/binutils/binutils-${BINUTILS_VERSION}.tar.xz"
+          tar xf "binutils-${BINUTILS_VERSION}.tar.xz"
+          mkdir binutils-build && cd binutils-build
+          "../binutils-${BINUTILS_VERSION}/configure" --target=powerpc-none-elf \
+            --prefix="$RUNNER_TEMP/ppc-binutils" --disable-nls --disable-werror \
+            --disable-gdb --disable-gprof --disable-sim --without-zstd
+          make -j"$(sysctl -n hw.ncpu)" all-gas all-ld all-binutils
+          make install-gas install-ld install-binutils
+
+      - name: Fetch, patch and build ReXGlue with tests
+        env:
+          REXGLUE_TESTS: "1"
+          PPC_BINUTILS_DIR: ${{ runner.temp }}/ppc-binutils/bin
+          BUILD_JOBS: "3"
+        run: |
+          ./tools/setup-macos.sh 2>&1 | tee "$RUNNER_TEMP/build.log"
+          exit "${PIPESTATUS[0]}"
+
+      - name: Unit tests
+        run: |
+          bin=$(find ../tools/rexglue/out -type f -name unit_tests -perm -u+x | head -1)
+          echo "Running $bin"
+          "$bin" 2>&1 | tee "$RUNNER_TEMP/unit_tests.log" | tail -60
+          exit "${PIPESTATUS[0]}"
+
+      - name: PowerPC instruction tests
+        if: always()
+        run: |
+          bin=$(find ../tools/rexglue/out -type f -name ppc_tests -perm -u+x | head -1)
+          echo "Running $bin"
+          "$bin" 2>&1 | tee "$RUNNER_TEMP/ppc_tests.log" | tail -60
+          exit "${PIPESTATUS[0]}"
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-port-logs
+          path: |
+            ${{ runner.temp }}/*.log
+          if-no-files-found: ignore

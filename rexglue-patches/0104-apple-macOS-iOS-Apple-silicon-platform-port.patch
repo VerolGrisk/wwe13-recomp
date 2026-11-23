@@ -1,0 +1,2421 @@
+From d8689812189636d7e647697d232b9ea668716cbe Mon Sep 17 00:00:00 2001
+From: WWE13 Recomp <wwe13-recomp@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 20:06:02 +0000
+Subject: [PATCH] apple: macOS / iOS (Apple silicon) platform port
+
+Build: Apple platform (macos-arm64 / ios-arm64), AppleClang 16+, no
+-mcmodel, -force_load for the kernel archive, no librt, lower-case arm64
+processor name, @loader_path rpaths, _XOPEN_SOURCE + _DARWIN_C_SOURCE on
+rexcore (PUBLIC) for <ucontext.h>.
+
+UI: SDL3 window backend (window_sdl, windowed_app_context_sdl,
+windowed_app_main_sdl) with a CAMetalLayer; MetalLayerSurface and
+VK_EXT_metal_surface so MoltenVK presents to it. SDL3 video/metal/haptic/
+sensor enabled on Apple only.
+
+Core: Darwin signal context (__ss/__ns/__es) in the exception handler and
+SIGBUS handled like SIGSEGV (Darwin raises SIGBUS for protection faults);
+Mach semaphores for thread suspend (no sem_init on Darwin), SIGUSR1/2
+instead of real-time signals, pthread_threadid_np, Darwin thread names, no
+affinity or SCHED_FIFO; mach_vm_region instead of /proc/self/maps,
+MAP_FIXED_NOREPLACE emulation, short shm_open names; _NSGetExecutablePath;
+fibers on Darwin ucontext; freeze logger without /proc on Apple.
+
+Linux and Windows code paths are unchanged.
+---
+ CMakeLists.txt                                |  46 +-
+ cmake/rexglue_helpers.cmake                   |  41 +-
+ cmake/rexglue_install.cmake                   |   1 +
+ include/rex/thread/fiber.h                    |   2 +-
+ include/rex/ui/surface.h                      |   2 +
+ include/rex/ui/surface_apple.h                |  36 +
+ include/rex/ui/vulkan/api.h                   |   7 +
+ .../functions/instance_ext_metal_surface.inc  |   2 +
+ include/rex/ui/vulkan/instance.h              |   7 +
+ include/rex/ui/window_sdl.h                   |  88 +++
+ include/rex/ui/windowed_app_context_sdl.h     |  60 ++
+ src/core/CMakeLists.txt                       |  12 +-
+ src/core/exception_handler_posix.cpp          | 103 ++-
+ src/core/filesystem_posix.cpp                 |  22 +
+ src/core/freeze_logger.cpp                    |  23 +-
+ src/core/memory_posix.cpp                     | 101 ++-
+ src/core/threading_posix.cpp                  | 126 +++-
+ src/ui/CMakeLists.txt                         |   9 +
+ src/ui/surface_apple.cpp                      |  25 +
+ src/ui/vulkan/vulkan_instance.cpp             |  10 +
+ src/ui/vulkan/vulkan_presenter.cpp            |  20 +
+ src/ui/window_sdl.cpp                         | 682 ++++++++++++++++++
+ src/ui/windowed_app_context_sdl.cpp           | 192 +++++
+ src/ui/windowed_app_main_sdl.cpp              | 101 +++
+ thirdparty/CMakeLists.txt                     |  15 +-
+ 25 files changed, 1703 insertions(+), 30 deletions(-)
+ create mode 100644 include/rex/ui/surface_apple.h
+ create mode 100644 include/rex/ui/vulkan/functions/instance_ext_metal_surface.inc
+ create mode 100644 include/rex/ui/window_sdl.h
+ create mode 100644 include/rex/ui/windowed_app_context_sdl.h
+ create mode 100644 src/ui/surface_apple.cpp
+ create mode 100644 src/ui/window_sdl.cpp
+ create mode 100644 src/ui/windowed_app_context_sdl.cpp
+ create mode 100644 src/ui/windowed_app_main_sdl.cpp
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 410a51d..ca90223 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -70,14 +70,26 @@ if(UNIX AND NOT APPLE)
+         "$ORIGIN/../${CMAKE_INSTALL_LIBDIR}"
+     )
+     set(CMAKE_INSTALL_RPATH_USE_LINK_PATH ON)
++elseif(APPLE)
++    # Same idea on Apple platforms: dylibs next to the executable or in ../lib.
++    set(CMAKE_MACOSX_RPATH ON)
++    list(APPEND CMAKE_INSTALL_RPATH
++        "@loader_path"
++        "@loader_path/../${CMAKE_INSTALL_LIBDIR}"
++    )
++    set(CMAKE_INSTALL_RPATH_USE_LINK_PATH ON)
+ endif()
+ 
+-# Enforce Clang18 compiler
+-if(NOT CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
++# Enforce Clang18 compiler. On Apple platforms Xcode's compiler reports itself as AppleClang with
++# its own version numbers; AppleClang 16 (Xcode 16) is the LLVM 17/18-era release with the C++23
++# library support ReXGlue needs, and Xcode's compiler is required for iOS builds.
++if(APPLE AND CMAKE_CXX_COMPILER_ID STREQUAL "AppleClang")
++    if(CMAKE_CXX_COMPILER_VERSION VERSION_LESS "16.0")
++        message(FATAL_ERROR "ReXGlue requires AppleClang 16 (Xcode 16) or newer (found ${CMAKE_CXX_COMPILER_VERSION})")
++    endif()
++elseif(NOT CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+     message(FATAL_ERROR "ReXGlue requires Clang compiler. Please set CMAKE_CXX_COMPILER to clang++")
+-endif()
+-
+-if(CMAKE_CXX_COMPILER_VERSION VERSION_LESS "18.0")
++elseif(CMAKE_CXX_COMPILER_VERSION VERSION_LESS "18.0")
+     message(FATAL_ERROR "ReXGlue requires Clang 18 or newer (found ${CMAKE_CXX_COMPILER_VERSION})")
+ endif()
+ 
+@@ -95,9 +107,11 @@ set(CMAKE_RELWITHDEBINFO_POSTFIX rd)
+ 
+ if(NOT WIN32)
+     # Use appropriate code model based on architecture
+-    if(CMAKE_SYSTEM_PROCESSOR MATCHES "AMD64|x86_64")
++    if(CMAKE_SYSTEM_PROCESSOR MATCHES "AMD64|x86_64" AND NOT APPLE)
+         # Large code model on x86_64 for linking with very large recompiled executables (35MB+)
+         add_compile_options(-mcmodel=large)
++    elseif(APPLE)
++        # Mach-O arm64 has a single code model (ADRP-based, +-4 GB); no -mcmodel flag.
+     else()
+         # Small code model for other architectures (ARM64, etc.)
+         add_compile_options(-mcmodel=small)
+@@ -121,7 +135,7 @@ add_compile_options(
+ if(WIN32)
+     if(CMAKE_SYSTEM_PROCESSOR MATCHES "AMD64|x86_64")
+         set(REX_PLATFORM "win-amd64")
+-    elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|ARM64")
++    elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|ARM64|arm64")
+         set(REX_PLATFORM "win-arm64")
+     else()
+         message(FATAL_ERROR "Unsupported Windows architecture: ${CMAKE_SYSTEM_PROCESSOR}")
+@@ -130,14 +144,28 @@ if(WIN32)
+ elseif(UNIX AND NOT APPLE)
+     if(CMAKE_SYSTEM_PROCESSOR MATCHES "AMD64|x86_64")
+         set(REX_PLATFORM "linux-amd64")
+-    elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|ARM64")
++    elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|ARM64|arm64")
+         set(REX_PLATFORM "linux-arm64")
+     else()
+         set(REX_PLATFORM "linux-${CMAKE_SYSTEM_PROCESSOR}")
+     endif()
+     add_compile_definitions(REX_PLATFORM_LINUX=1)
++elseif(APPLE)
++    # macOS and iOS/iPadOS on Apple silicon. CMAKE_SYSTEM_PROCESSOR is "arm64" here
++    # (lower case), and REX_PLATFORM_MAC is derived from TargetConditionals.h in platform.h.
++    if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|ARM64|arm64" AND NOT CMAKE_OSX_ARCHITECTURES STREQUAL "arm64")
++        message(FATAL_ERROR "ReXGlue supports Apple platforms on Apple silicon (arm64) only "
++                            "(found ${CMAKE_SYSTEM_PROCESSOR}). Set CMAKE_OSX_ARCHITECTURES=arm64.")
++    endif()
++    if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
++        set(REX_PLATFORM "ios-arm64")
++        set(REX_PLATFORM_IOS_BUILD TRUE)
++    else()
++        set(REX_PLATFORM "macos-arm64")
++    endif()
++    set(REX_PLATFORM_APPLE_BUILD TRUE)
+ else()
+-    message(FATAL_ERROR "Unsupported platform. ReXGlue supports Windows and Linux only.")
++    message(FATAL_ERROR "Unsupported platform. ReXGlue supports Windows, Linux and Apple (arm64).")
+ endif()
+ 
+ # Build config as compile definition (multi-config generators don't know config at configure time)
+diff --git a/cmake/rexglue_helpers.cmake b/cmake/rexglue_helpers.cmake
+index 7f3c262..bebee84 100644
+--- a/cmake/rexglue_helpers.cmake
++++ b/cmake/rexglue_helpers.cmake
+@@ -15,6 +15,10 @@ function(rexglue_configure_target target_name)
+     if(WIN32)
+         target_sources(${target_name} PRIVATE
+             ${REXGLUE_SHARE_DIR}/windowed_app_main_win.cpp)
++    elseif(APPLE)
++        # macOS / iOS: SDL3 window and event loop (MoltenVK presents to its Metal layer).
++        target_sources(${target_name} PRIVATE
++            ${REXGLUE_SHARE_DIR}/windowed_app_main_sdl.cpp)
+     else()
+         target_sources(${target_name} PRIVATE
+             ${REXGLUE_SHARE_DIR}/windowed_app_main_posix.cpp)
+@@ -33,6 +37,11 @@ function(rexglue_configure_target target_name)
+         target_link_options(${target_name} PRIVATE
+             "LINKER:/WHOLEARCHIVE:$<TARGET_FILE:rex::kernel>"
+         )
++    elseif(APPLE)
++        # ld64 has no --whole-archive; -force_load keeps every kernel hook object.
++        target_link_options(${target_name} PRIVATE
++            "LINKER:-force_load,$<TARGET_FILE:rex::kernel>"
++        )
+     else()
+         target_link_options(${target_name} PRIVATE
+             -Wl,--whole-archive
+@@ -51,11 +60,27 @@ function(rexglue_configure_target target_name)
+         if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
+             target_link_options(${target_name} PRIVATE -Wl,--no-relax)
+             target_compile_options(${target_name} PRIVATE -mcmodel=large)
+-        elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|ARM64")
++        elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|ARM64|arm64")
+             target_compile_options(${target_name} PRIVATE -march=armv8-a)
+         endif()
+     endif()
+ 
++    # Apple platform settings (macOS / iOS on Apple silicon). The window backend uses SDL3 and
++    # MoltenVK through VK_EXT_metal_surface; the frameworks below are what those need at link time.
++    if(APPLE)
++        target_link_libraries(${target_name} PRIVATE
++            "-framework Foundation" "-framework CoreFoundation" "-framework QuartzCore"
++            "-framework Metal" "-framework IOKit" "-framework GameController"
++            "-framework CoreHaptics" "-framework AVFoundation" "-framework AudioToolbox"
++            "-framework CoreAudio" "-framework CoreVideo" "-framework CoreMotion")
++        if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
++            target_link_libraries(${target_name} PRIVATE "-framework UIKit")
++        else()
++            target_link_libraries(${target_name} PRIVATE "-framework AppKit" "-framework Carbon"
++                                                         "-framework ForceFeedback")
++        endif()
++    endif()
++
+     if(NOT MSVC)
+         if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
+             target_compile_options(${target_name} PRIVATE -msse4.1)
+@@ -87,6 +112,20 @@ function(rexglue_configure_target target_name)
+                         "$<TARGET_FILE_DIR:${target_name}>"
+                     VERBATIM
+                 )
++            elseif(APPLE)
++                set_target_properties(${target_name} PROPERTIES
++                    BUILD_WITH_INSTALL_RPATH TRUE
++                    INSTALL_RPATH "@executable_path;@executable_path/../Frameworks"
++                )
++                add_custom_command(TARGET ${target_name} POST_BUILD
++                    COMMAND ${CMAKE_COMMAND} -E copy_if_different
++                        "$<TARGET_FILE:rex::libavcodec>"
++                        "$<TARGET_FILE_DIR:${target_name}>"
++                    COMMAND ${CMAKE_COMMAND} -E copy_if_different
++                        "$<TARGET_FILE:rex::libavutil>"
++                        "$<TARGET_FILE_DIR:${target_name}>"
++                    VERBATIM
++                )
+             elseif(WIN32)
+                 # The SDK kernel also calls BCrypt directly. With FFmpeg now
+                 # in DLLs, its former static-library bcrypt dependency no
+diff --git a/cmake/rexglue_install.cmake b/cmake/rexglue_install.cmake
+index c38ac46..0679e70 100644
+--- a/cmake/rexglue_install.cmake
++++ b/cmake/rexglue_install.cmake
+@@ -123,6 +123,7 @@ endif()
+ install(FILES
+     src/ui/windowed_app_main_win.cpp
+     src/ui/windowed_app_main_posix.cpp
++    src/ui/windowed_app_main_sdl.cpp
+     src/ui/rex_app.cpp
+     DESTINATION ${CMAKE_INSTALL_DATADIR}/rexglue
+ )
+diff --git a/include/rex/thread/fiber.h b/include/rex/thread/fiber.h
+index 64e70a7..d1f247e 100644
+--- a/include/rex/thread/fiber.h
++++ b/include/rex/thread/fiber.h
+@@ -51,7 +51,7 @@ struct Fiber {
+ #if REX_PLATFORM_WIN32
+   void* handle_ = nullptr;
+   bool is_thread_fiber_ = false;
+-#elif REX_PLATFORM_LINUX
++#elif REX_PLATFORM_LINUX || REX_PLATFORM_MAC
+   ucontext_t context_{};
+   std::vector<uint8_t> stack_;
+   void (*entry_)(void*) = nullptr;
+diff --git a/include/rex/ui/surface.h b/include/rex/ui/surface.h
+index 34e1d65..ecdc7f8 100644
+--- a/include/rex/ui/surface.h
++++ b/include/rex/ui/surface.h
+@@ -33,12 +33,14 @@ class Surface {
+     kTypeIndex_XcbWindow,
+     // Windows.
+     kTypeIndex_Win32Hwnd,
++    kTypeIndex_MetalLayer,
+   };
+   using TypeFlags = uint32_t;
+   enum : TypeFlags {
+     kTypeFlag_AndroidNativeWindow = TypeFlags(1) << kTypeIndex_AndroidNativeWindow,
+     kTypeFlag_XcbWindow = TypeFlags(1) << kTypeIndex_XcbWindow,
+     kTypeFlag_Win32Hwnd = TypeFlags(1) << kTypeIndex_Win32Hwnd,
++    kTypeFlag_MetalLayer = TypeFlags(1) << kTypeIndex_MetalLayer,
+   };
+ 
+   Surface(const Surface& surface) = delete;
+diff --git a/include/rex/ui/surface_apple.h b/include/rex/ui/surface_apple.h
+new file mode 100644
+index 0000000..38b6697
+--- /dev/null
++++ b/include/rex/ui/surface_apple.h
+@@ -0,0 +1,36 @@
++/**
++ * ReXGlue Apple (macOS / iOS) presentation surface.
++ *
++ * A CAMetalLayer owned by an SDL3 window (SDL_Metal_CreateView / SDL_Metal_GetLayer). MoltenVK
++ * creates the Vulkan surface from the layer with VK_EXT_metal_surface. Kept free of Objective-C so
++ * the presenter can stay plain C++: the layer is an opaque pointer and the drawable size comes
++ * from SDL.
++ */
++
++#pragma once
++
++#include <rex/ui/surface.h>
++
++struct SDL_Window;
++
++namespace rex {
++namespace ui {
++
++class MetalLayerSurface final : public Surface {
++ public:
++  MetalLayerSurface(SDL_Window* window, void* metal_layer) : window_(window), layer_(metal_layer) {}
++  TypeIndex GetType() const override { return kTypeIndex_MetalLayer; }
++  // CAMetalLayer*, as an opaque pointer.
++  void* layer() const { return layer_; }
++  SDL_Window* window() const { return window_; }
++
++ protected:
++  bool GetSizeImpl(uint32_t& width_out, uint32_t& height_out) const override;
++
++ private:
++  SDL_Window* window_;
++  void* layer_;
++};
++
++}  // namespace ui
++}  // namespace rex
+diff --git a/include/rex/ui/vulkan/api.h b/include/rex/ui/vulkan/api.h
+index 278e955..7f155ec 100644
+--- a/include/rex/ui/vulkan/api.h
++++ b/include/rex/ui/vulkan/api.h
+@@ -38,6 +38,13 @@
+ #endif
+ #endif
+ 
++#if REX_PLATFORM_MAC
++// macOS and iOS: MoltenVK presents to a CAMetalLayer (VK_EXT_metal_surface).
++#ifndef VK_USE_PLATFORM_METAL_EXT
++#define VK_USE_PLATFORM_METAL_EXT
++#endif
++#endif
++
+ #if REX_PLATFORM_WIN32
+ #ifndef WIN32_LEAN_AND_MEAN
+ #define WIN32_LEAN_AND_MEAN
+diff --git a/include/rex/ui/vulkan/functions/instance_ext_metal_surface.inc b/include/rex/ui/vulkan/functions/instance_ext_metal_surface.inc
+new file mode 100644
+index 0000000..d2bc564
+--- /dev/null
++++ b/include/rex/ui/vulkan/functions/instance_ext_metal_surface.inc
+@@ -0,0 +1,2 @@
++// VK_EXT_metal_surface functions used by the Apple (MoltenVK) presenter.
++XE_UI_VULKAN_FUNCTION(vkCreateMetalSurfaceEXT)
+diff --git a/include/rex/ui/vulkan/instance.h b/include/rex/ui/vulkan/instance.h
+index e672629..5da9073 100644
+--- a/include/rex/ui/vulkan/instance.h
++++ b/include/rex/ui/vulkan/instance.h
+@@ -66,6 +66,10 @@ class VulkanInstance {
+     // VK_KHR_win32_surface (#10)
+ #ifdef VK_USE_PLATFORM_WIN32_KHR
+ #include <rex/ui/vulkan/functions/instance_khr_win32_surface.inc>
++#endif
++    // VK_EXT_metal_surface (#218)
++#ifdef VK_USE_PLATFORM_METAL_EXT
++#include <rex/ui/vulkan/functions/instance_ext_metal_surface.inc>
+ #endif
+     // VK_KHR_get_physical_device_properties2 (#60, promoted to 1.1)
+ #include <rex/ui/vulkan/functions/instance_1_1_khr_get_physical_device_properties2.inc>
+@@ -91,6 +95,9 @@ class VulkanInstance {
+ #endif
+ #ifdef VK_USE_PLATFORM_WIN32_KHR
+     bool ext_KHR_win32_surface = false;  // #10
++#endif
++#ifdef VK_USE_PLATFORM_METAL_EXT
++    bool ext_EXT_metal_surface = false;  // #218
+ #endif
+     bool ext_1_1_KHR_get_physical_device_properties2 = false;  // #60
+     bool ext_EXT_debug_utils = false;                          // #129
+diff --git a/include/rex/ui/window_sdl.h b/include/rex/ui/window_sdl.h
+new file mode 100644
+index 0000000..15ff74e
+--- /dev/null
++++ b/include/rex/ui/window_sdl.h
+@@ -0,0 +1,88 @@
++/**
++ * ReXGlue SDL3 window (macOS / iOS).
++ *
++ * An SDL3 window with a CAMetalLayer (SDL_Metal_CreateView), presented by MoltenVK through
++ * VK_EXT_metal_surface. Sizes and mouse coordinates are reported in pixels (backing store), so
++ * Retina displays render at full resolution.
++ */
++
++#pragma once
++
++#include <memory>
++#include <string>
++
++#include <rex/ui/menu_item.h>
++#include <rex/ui/window.h>
++
++struct SDL_Window;
++union SDL_Event;
++
++namespace rex {
++namespace ui {
++
++class SDLWindowedAppContext;
++
++class SDLWindow : public Window {
++  using super = Window;
++
++ public:
++  SDLWindow(WindowedAppContext& app_context, const std::string_view title,
++            uint32_t desired_logical_width, uint32_t desired_logical_height);
++  ~SDLWindow() override;
++
++  SDL_Window* window() const { return window_; }
++  void* GetNativeWindowHandle() const override { return window_; }
++
++  // Called by SDLWindowedAppContext on the UI thread.
++  void HandleEvent(const SDL_Event& event);
++  void HandlePaintEvent();
++  void HandleQuitRequest();
++
++ protected:
++  uint32_t GetLatestDpiImpl() const override;
++
++  bool OpenImpl() override;
++  void RequestCloseImpl() override;
++
++  void ApplyNewFullscreen() override;
++  void ApplyNewTitle() override;
++  void ApplyNewCursorVisibility(CursorVisibility old_cursor_visibility) override;
++  void FocusImpl() override;
++
++  std::unique_ptr<Surface> CreateSurfaceImpl(Surface::TypeFlags allowed_types) override;
++  void RequestPaintImpl() override;
++
++ private:
++  SDLWindowedAppContext& sdl_app_context() const;
++  void ReportActualSize(WindowDestructionReceiver& destruction_receiver);
++  void HandleKeyboard(const SDL_Event& event, WindowDestructionReceiver& destruction_receiver);
++  void HandleMouse(const SDL_Event& event, WindowDestructionReceiver& destruction_receiver);
++  void HandleTouch(const SDL_Event& event, WindowDestructionReceiver& destruction_receiver);
++  void CloseFromSDL();
++  void ApplyCursorHidden(bool hidden);
++
++  SDL_Window* window_ = nullptr;
++  uint32_t window_id_ = 0;
++  // SDL_MetalView (opaque) and its CAMetalLayer.
++  void* metal_view_ = nullptr;
++  void* metal_layer_ = nullptr;
++  // Cursor auto-hide (CursorVisibility::kAutoHidden): hidden until the mouse moves, hidden again
++  // kDefaultCursorAutoHideMilliseconds after the last movement.
++  uint64_t cursor_last_activity_ms_ = 0;
++  bool cursor_hidden_ = false;
++};
++
++class SDLMenuItem : public MenuItem {
++ public:
++  SDLMenuItem(Type type, const std::string& text, const std::string& hotkey,
++              std::function<void()> callback)
++      : MenuItem(type, text, hotkey, std::move(callback)) {}
++
++ protected:
++  // No native menu bar for SDL windows; menus are drawn in-game (ImGui) where needed.
++  void OnChildAdded(MenuItem* child_item) override { (void)child_item; }
++  void OnChildRemoved(MenuItem* child_item) override { (void)child_item; }
++};
++
++}  // namespace ui
++}  // namespace rex
+diff --git a/include/rex/ui/windowed_app_context_sdl.h b/include/rex/ui/windowed_app_context_sdl.h
+new file mode 100644
+index 0000000..292a957
+--- /dev/null
++++ b/include/rex/ui/windowed_app_context_sdl.h
+@@ -0,0 +1,60 @@
++/**
++ * ReXGlue SDL3 windowed app context (macOS / iOS).
++ *
++ * The UI thread runs SDL's event loop. Other threads wake it with SDL user events (SDL_PushEvent
++ * is thread-safe), which is how pending UI-thread functions and paint requests are delivered.
++ */
++
++#pragma once
++
++#include <atomic>
++#include <cstdint>
++#include <unordered_map>
++
++#include <rex/ui/windowed_app_context.h>
++
++union SDL_Event;
++
++namespace rex {
++namespace ui {
++
++class SDLWindow;
++
++class SDLWindowedAppContext final : public WindowedAppContext {
++ public:
++  SDLWindowedAppContext();
++  ~SDLWindowedAppContext();
++
++  // SDL_Init(VIDEO | EVENTS) and event type registration. Call on the main thread before creating
++  // the app; returns false (and logs to stderr) if SDL could not start.
++  bool Initialize();
++
++  void NotifyUILoopOfPendingFunctions() override;
++
++  void PlatformQuitFromUIThread() override;
++
++  bool ShowSimpleMessageBox(const char* title, const char* message) override;
++
++  void RunMainSDLLoop();
++
++  // Window registry for event routing (UI thread only).
++  void RegisterWindow(uint32_t sdl_window_id, SDLWindow* window);
++  void UnregisterWindow(uint32_t sdl_window_id);
++
++  // Coalesced paint request for a window; may be called from the UI thread only.
++  void RequestPaint(uint32_t sdl_window_id);
++
++ private:
++  void DispatchEvent(const SDL_Event& event);
++
++  bool sdl_initialized_ = false;
++  uint32_t pending_functions_event_type_ = 0;
++  uint32_t paint_event_type_ = 0;
++  std::atomic<bool> pending_functions_event_queued_{false};
++  bool quit_requested_ = false;
++  std::unordered_map<uint32_t, SDLWindow*> windows_;
++  std::unordered_map<uint32_t, bool> paint_queued_;
++};
++
++}  // namespace ui
++}  // namespace rex
+diff --git a/src/core/CMakeLists.txt b/src/core/CMakeLists.txt
+index ab8d380..94134b7 100644
+--- a/src/core/CMakeLists.txt
++++ b/src/core/CMakeLists.txt
+@@ -76,7 +76,17 @@ target_include_directories(rexcore PRIVATE
+ )
+ 
+ if(UNIX)
+-    target_link_libraries(rexcore PRIVATE pthread rt dl)
++    if(APPLE)
++        # Darwin has no librt; pthread and dl live in libSystem.
++        target_link_libraries(rexcore PRIVATE pthread dl)
++        # <ucontext.h> (fibers, signal contexts) requires _XOPEN_SOURCE on Darwin; _DARWIN_C_SOURCE
++        # keeps the Darwin extensions (pthread_threadid_np, MAP_ANON, Mach) visible alongside it.
++        # PUBLIC so every ReXGlue library and the game see the same <ucontext.h> layout; third-party
++        # code (SDL's Cocoa backend, FFmpeg) is not affected.
++        target_compile_definitions(rexcore PUBLIC _XOPEN_SOURCE=700 _DARWIN_C_SOURCE=1)
++    else()
++        target_link_libraries(rexcore PRIVATE pthread rt dl)
++    endif()
+ elseif(WIN32)
+     target_link_libraries(rexcore PRIVATE winmm)
+ endif()
+diff --git a/src/core/exception_handler_posix.cpp b/src/core/exception_handler_posix.cpp
+index d254dd4..39fad6d 100644
+--- a/src/core/exception_handler_posix.cpp
++++ b/src/core/exception_handler_posix.cpp
+@@ -24,13 +24,30 @@
+ #include <rex/math.h>
+ #include <rex/platform.h>
+ 
++#if REX_PLATFORM_MAC
++// Darwin: the thread state lives behind uc_mcontext (a pointer), in __ss (general registers),
++// __ns (NEON/FP) and __es (fault address and ESR). <sys/ucontext.h> avoids the deprecated
++// <ucontext.h> function declarations that need _XOPEN_SOURCE.
++#include <mach/thread_status.h>  // arm_thread_state64_get/set_* accessors
++#include <sys/ucontext.h>
++#else
+ #include <ucontext.h>
++#endif
++
++#if REX_PLATFORM_MAC && !REX_ARCH_ARM64
++#error "ReXGlue supports Apple platforms on Apple silicon (arm64) only"
++#endif
+ 
+ namespace rex::arch {
+ 
+ bool signal_handlers_installed_ = false;
+ struct sigaction original_sigill_handler_;
+ struct sigaction original_sigsegv_handler_;
++#if REX_PLATFORM_MAC
++// Darwin delivers protection faults on mapped pages (KERN_PROTECTION_FAILURE) as SIGBUS, not
++// SIGSEGV; MMIO and write-watch traps rely on exactly those, so SIGBUS is handled the same way.
++struct sigaction original_sigbus_handler_;
++#endif
+ 
+ // This can be as large as needed, but isn't often needed.
+ // As we will be sometimes firing many exceptions we want to avoid having to
+@@ -51,6 +68,10 @@ static void ChainUnhandledSignal(int signal_number, siginfo_t* signal_info,
+     original = &original_sigill_handler_;
+   } else if (signal_number == SIGSEGV) {
+     original = &original_sigsegv_handler_;
++#if REX_PLATFORM_MAC
++  } else if (signal_number == SIGBUS) {
++    original = &original_sigbus_handler_;
++#endif
+   }
+   if (!original || original->sa_handler == SIG_IGN) {
+     return;
+@@ -73,6 +94,24 @@ static void ChainUnhandledSignal(int signal_number, siginfo_t* signal_info,
+ 
+ static void ExceptionHandlerCallback(int signal_number, siginfo_t* signal_info,
+                                      void* signal_context) {
++#if REX_PLATFORM_MAC
++  // Darwin arm64: mcontext_t is a pointer to __darwin_mcontext64.
++  mcontext_t darwin_mcontext = reinterpret_cast<ucontext_t*>(signal_context)->uc_mcontext;
++
++  HostThreadContext thread_context;
++
++  // x0-x28 are __x; x29 (fp) and x30 (lr) are separate fields.
++  std::memcpy(thread_context.x, darwin_mcontext->__ss.__x, sizeof(darwin_mcontext->__ss.__x));
++  thread_context.x[29] = arm_thread_state64_get_fp(darwin_mcontext->__ss);
++  thread_context.x[30] = uint64_t(arm_thread_state64_get_lr(darwin_mcontext->__ss));
++  thread_context.sp = arm_thread_state64_get_sp(darwin_mcontext->__ss);
++  thread_context.pc = uint64_t(arm_thread_state64_get_pc(darwin_mcontext->__ss));
++  thread_context.pstate = darwin_mcontext->__ss.__cpsr;
++  thread_context.fpsr = darwin_mcontext->__ns.__fpsr;
++  thread_context.fpcr = darwin_mcontext->__ns.__fpcr;
++  static_assert(sizeof(thread_context.v) == sizeof(darwin_mcontext->__ns.__v));
++  std::memcpy(thread_context.v, darwin_mcontext->__ns.__v, sizeof(thread_context.v));
++#else
+   mcontext_t& mcontext = reinterpret_cast<ucontext_t*>(signal_context)->uc_mcontext;
+ 
+   HostThreadContext thread_context;
+@@ -130,15 +169,37 @@ static void ExceptionHandlerCallback(int signal_number, siginfo_t* signal_info,
+     std::memcpy(thread_context.v, mcontext_fpsimd->vregs, sizeof(thread_context.v));
+   }
+ #endif  // REX_ARCH
++#endif  // REX_PLATFORM_MAC
+ 
+   Exception ex;
+   switch (signal_number) {
+     case SIGILL:
+       ex.InitializeIllegalInstruction(&thread_context);
+       break;
++#if REX_PLATFORM_MAC
++    case SIGBUS:
++#endif
+     case SIGSEGV: {
+       Exception::AccessViolationOperation access_violation_operation;
+-#if REX_ARCH_AMD64
++#if REX_PLATFORM_MAC
++      {
++        // __es.__esr is ESR_EL1 for the fault: a Data Abort (EC 0b10010x) has WnR in bit 6.
++        const uint64_t esr = darwin_mcontext->__es.__esr;
++        bool instruction_is_store;
++        if (((esr >> 26) & 0b111110) == 0b100100) {
++          access_violation_operation = (esr & (UINT64_C(1) << 6))
++                                           ? Exception::AccessViolationOperation::kWrite
++                                           : Exception::AccessViolationOperation::kRead;
++        } else if (IsArm64LoadPrefetchStore(*reinterpret_cast<const uint32_t*>(thread_context.pc),
++                                            instruction_is_store)) {
++          access_violation_operation = instruction_is_store
++                                           ? Exception::AccessViolationOperation::kWrite
++                                           : Exception::AccessViolationOperation::kRead;
++        } else {
++          access_violation_operation = Exception::AccessViolationOperation::kUnknown;
++        }
++      }
++#elif REX_ARCH_AMD64
+       // x86_pf_error_code::X86_PF_WRITE
+       constexpr uint64_t kX86PageFaultErrorCodeWrite = UINT64_C(1) << 1;
+       access_violation_operation = (uint64_t(mcontext.gregs[REG_ERR]) & kX86PageFaultErrorCodeWrite)
+@@ -190,7 +251,35 @@ static void ExceptionHandlerCallback(int signal_number, siginfo_t* signal_info,
+   for (size_t i = 0; i < rex::countof(handlers_) && handlers_[i].first; ++i) {
+     if (handlers_[i].first(&ex, handlers_[i].second)) {
+       // Exception handled.
+-#if REX_ARCH_AMD64
++#if REX_PLATFORM_MAC
++      {
++        uint32_t modified_register_index;
++        uint32_t modified_x_registers_remaining = ex.modified_x_registers();
++        while (rex::bit_scan_forward(modified_x_registers_remaining, &modified_register_index)) {
++          modified_x_registers_remaining &= ~(UINT32_C(1) << modified_register_index);
++          const uint64_t value = thread_context.x[modified_register_index];
++          if (modified_register_index < 29) {
++            darwin_mcontext->__ss.__x[modified_register_index] = value;
++          } else if (modified_register_index == 29) {
++            arm_thread_state64_set_fp(darwin_mcontext->__ss, value);
++          } else {
++            arm_thread_state64_set_lr_fptr(darwin_mcontext->__ss, reinterpret_cast<void*>(value));
++          }
++        }
++        arm_thread_state64_set_sp(darwin_mcontext->__ss, thread_context.sp);
++        arm_thread_state64_set_pc_fptr(darwin_mcontext->__ss,
++                                       reinterpret_cast<void*>(thread_context.pc));
++        darwin_mcontext->__ss.__cpsr = uint32_t(thread_context.pstate);
++        darwin_mcontext->__ns.__fpsr = thread_context.fpsr;
++        darwin_mcontext->__ns.__fpcr = thread_context.fpcr;
++        uint32_t modified_v_registers_remaining = ex.modified_v_registers();
++        while (rex::bit_scan_forward(modified_v_registers_remaining, &modified_register_index)) {
++          modified_v_registers_remaining &= ~(UINT32_C(1) << modified_register_index);
++          std::memcpy(&darwin_mcontext->__ns.__v[modified_register_index],
++                      &thread_context.v[modified_register_index], sizeof(vec128_t));
++        }
++      }
++#elif REX_ARCH_AMD64
+       mcontext.gregs[REG_RIP] = greg_t(thread_context.rip);
+       mcontext.gregs[REG_EFL] = greg_t(thread_context.eflags);
+       uint32_t modified_register_index;
+@@ -254,6 +343,11 @@ void ExceptionHandler::Install(Handler fn, void* data) {
+     if (sigaction(SIGSEGV, &signal_handler, &original_sigsegv_handler_) != 0) {
+       assert_always("Failed to install new SIGSEGV handler");
+     }
++#if REX_PLATFORM_MAC
++    if (sigaction(SIGBUS, &signal_handler, &original_sigbus_handler_) != 0) {
++      assert_always("Failed to install new SIGBUS handler");
++    }
++#endif
+     signal_handlers_installed_ = true;
+   }
+ 
+@@ -294,6 +388,11 @@ void ExceptionHandler::Uninstall(Handler fn, void* data) {
+       if (sigaction(SIGSEGV, &original_sigsegv_handler_, NULL) != 0) {
+         assert_always("Failed to restore original SIGSEGV handler");
+       }
++#if REX_PLATFORM_MAC
++      if (sigaction(SIGBUS, &original_sigbus_handler_, NULL) != 0) {
++        assert_always("Failed to restore original SIGBUS handler");
++      }
++#endif
+       signal_handlers_installed_ = false;
+     }
+   }
+diff --git a/src/core/filesystem_posix.cpp b/src/core/filesystem_posix.cpp
+index 00648e4..f939256 100644
+--- a/src/core/filesystem_posix.cpp
++++ b/src/core/filesystem_posix.cpp
+@@ -28,6 +28,12 @@
+ #include <dirent.h>
+ #include <ftw.h>
+ #include <libgen.h>
++#include <rex/platform.h>
++#if REX_PLATFORM_MAC
++#include <limits.h>
++#include <mach-o/dyld.h>
++#include <cstdlib>
++#endif
+ #include <pwd.h>
+ 
+ namespace rex {
+@@ -51,10 +57,26 @@ std::filesystem::path to_path(const std::u16string_view source) {
+ namespace filesystem {
+ 
+ std::filesystem::path GetExecutablePath() {
++#if REX_PLATFORM_MAC
++  // No /proc on Darwin: ask dyld, then resolve symlinks and ".." like readlink(/proc/self/exe).
++  uint32_t size = 0;
++  _NSGetExecutablePath(nullptr, &size);
++  std::string path(size, '\0');
++  if (_NSGetExecutablePath(path.data(), &size) != 0) {
++    return {};
++  }
++  path.resize(std::strlen(path.c_str()));
++  char resolved[PATH_MAX];
++  if (realpath(path.c_str(), resolved)) {
++    return std::filesystem::path(resolved);
++  }
++  return std::filesystem::path(path);
++#else
+   char buff[FILENAME_MAX] = "";
+   readlink("/proc/self/exe", buff, FILENAME_MAX);
+   std::string s(buff);
+   return s;
++#endif
+ }
+ 
+ std::filesystem::path GetExecutableFolder() {
+diff --git a/src/core/freeze_logger.cpp b/src/core/freeze_logger.cpp
+index 7f8c74c..647a5a7 100644
+--- a/src/core/freeze_logger.cpp
++++ b/src/core/freeze_logger.cpp
+@@ -40,6 +40,14 @@
+ #if defined(_WIN32)
+ #define WIN32_LEAN_AND_MEAN
+ #include <windows.h>
++#elif defined(__APPLE__)
++// Apple: no /proc, ELF or tgkill. Freeze reports work, without host backtraces, per-thread CPU
++// time or thread state for now (the Linux-only parts below are compiled out).
++#include <execinfo.h>
++#include <fcntl.h>
++#include <signal.h>
++#include <time.h>
++#include <unistd.h>
+ #else
+ #include <elf.h>
+ #include <execinfo.h>
+@@ -180,7 +188,9 @@ std::vector<char> g_symbol_strings;
+ uint64_t g_symbol_base = 0;
+ bool g_symbols_loaded = false;
+ 
+-#if !defined(_WIN32)
++#if defined(__APPLE__)
++void LoadSymbols() {}
++#elif !defined(_WIN32)
+ int SymbolsPhdrCallback(struct dl_phdr_info* info, size_t, void*) {
+   if (!info->dlpi_name || info->dlpi_name[0] == '\0') {
+     g_symbol_base = static_cast<uint64_t>(info->dlpi_addr);
+@@ -253,7 +263,7 @@ void LoadSymbols() {
+ #endif
+ 
+ const char* SymbolizeHostPc(uint64_t pc) {
+-#if defined(_WIN32)
++#if defined(_WIN32) || defined(__APPLE__)
+   (void)pc;
+   return nullptr;
+ #else
+@@ -285,6 +295,9 @@ uint64_t ReadHostCpuNs(uint32_t tid) {
+   }
+   CloseHandle(handle);
+   return total;
++#elif defined(__APPLE__)
++  (void)tid;
++  return UINT64_MAX;
+ #else
+   if (tid == 0) return UINT64_MAX;
+   std::ifstream input("/proc/self/task/" + std::to_string(tid) + "/stat");
+@@ -412,7 +425,7 @@ void OnCaptureSignal(int, siginfo_t*, void*) {
+ #endif
+ 
+ void InstallCaptureHandler() {
+-#if !defined(_WIN32)
++#if !defined(_WIN32) && !defined(__APPLE__)
+   g_capture_signal = SIGRTMIN + 3;
+   struct sigaction action {};
+   action.sa_sigaction = OnCaptureSignal;
+@@ -460,6 +473,8 @@ void RequestCapture(ThreadSlot* slot) {
+     ResumeThread(handle);
+   }
+   CloseHandle(handle);
++#elif defined(__APPLE__)
++  (void)slot;
+ #else
+   const uint32_t tid = slot->host_tid.load(std::memory_order_relaxed);
+   if (tid == 0) return;
+@@ -505,7 +520,7 @@ void SampleSpinPcs(const int* indices, int count) {
+ }
+ 
+ std::string ReadHostState(uint32_t tid) {
+-#if defined(_WIN32)
++#if defined(_WIN32) || defined(__APPLE__)
+   (void)tid;
+   return "?";
+ #else
+diff --git a/src/core/memory_posix.cpp b/src/core/memory_posix.cpp
+index fce701e..9138b02 100644
+--- a/src/core/memory_posix.cpp
++++ b/src/core/memory_posix.cpp
+@@ -38,6 +38,14 @@
+ // #include "xenia/base/main_android.h"
+ #endif
+ 
++#if REX_PLATFORM_MAC
++#include <mach/mach.h>
++#include <mach/mach_vm.h>
++// off_t is always 64-bit on Darwin; there are no separate *64 functions.
++#define ftruncate64 ftruncate
++#define mmap64 mmap
++#endif
++
+ namespace rex {
+ namespace memory {
+ 
+@@ -51,6 +59,21 @@ static std::string MakeShmName(const std::filesystem::path& path) {
+   if (name.empty() || name[0] != '/') {
+     name.insert(name.begin(), '/');
+   }
++#if REX_PLATFORM_MAC
++  // Darwin limits POSIX shared memory names to PSHMNAMLEN (31) characters: replace long names
++  // with a stable hash of the full name plus the process ID (two running copies must not share).
++  constexpr size_t kDarwinShmNameMax = 31;
++  if (name.size() > kDarwinShmNameMax) {
++    uint64_t hash = 0xcbf29ce484222325ull;  // FNV-1a
++    for (unsigned char c : name) {
++      hash = (hash ^ c) * 0x100000001b3ull;
++    }
++    char short_name[kDarwinShmNameMax + 1];
++    std::snprintf(short_name, sizeof(short_name), "/rex%08x%016llx", unsigned(getpid()),
++                  static_cast<unsigned long long>(hash));
++    name = short_name;
++  }
++#endif
+   return name;
+ }
+ 
+@@ -134,6 +157,64 @@ static bool ParseProcMapsLine(const std::string& line, LinuxMapEntry& out) {
+   return out.start < out.end;
+ }
+ 
++#if REX_PLATFORM_MAC
++// Darwin has no /proc/self/maps; mach_vm_region returns the region at or above an address with
++// its current protection, which is filled into the same entry shape as the Linux parser's.
++static bool DarwinRegionAtOrAbove(uintptr_t address, LinuxMapEntry& out) {
++  mach_vm_address_t region_address = address;
++  mach_vm_size_t region_size = 0;
++  vm_region_basic_info_data_64_t info;
++  mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
++  mach_port_t object_name = MACH_PORT_NULL;
++  if (mach_vm_region(mach_task_self(), &region_address, &region_size, VM_REGION_BASIC_INFO_64,
++                     reinterpret_cast<vm_region_info_t>(&info), &count,
++                     &object_name) != KERN_SUCCESS) {
++    return false;
++  }
++  out = LinuxMapEntry{};
++  out.start = uintptr_t(region_address);
++  out.end = uintptr_t(region_address + region_size);
++  out.perms[0] = (info.protection & VM_PROT_READ) ? 'r' : '-';
++  out.perms[1] = (info.protection & VM_PROT_WRITE) ? 'w' : '-';
++  out.perms[2] = (info.protection & VM_PROT_EXECUTE) ? 'x' : '-';
++  out.perms[3] = info.shared ? 's' : 'p';
++  return out.start < out.end;
++}
++
++static bool FindEntryForAddress(void* address, LinuxMapEntry& out_entry) {
++  const uintptr_t addr = reinterpret_cast<uintptr_t>(address);
++  LinuxMapEntry e;
++  if (!DarwinRegionAtOrAbove(addr, e) || addr < e.start || addr >= e.end) {
++    return false;
++  }
++  out_entry = e;
++  return true;
++}
++
++static bool IsRangeFullyMapped(void* base_address, size_t length) {
++  if (!base_address || length == 0)
++    return false;
++  const uintptr_t begin = reinterpret_cast<uintptr_t>(base_address);
++  const uintptr_t end = begin + length;
++  if (end < begin)
++    return false;
++  uintptr_t cursor = begin;
++  while (cursor < end) {
++    LinuxMapEntry e;
++    if (!DarwinRegionAtOrAbove(cursor, e) || e.start > cursor)
++      return false;  // gap
++    cursor = e.end;
++  }
++  return true;
++}
++
++// True if any part of [base, base+length) is already mapped.
++static bool IsRangePartlyMapped(void* base_address, size_t length) {
++  const uintptr_t begin = reinterpret_cast<uintptr_t>(base_address);
++  LinuxMapEntry e;
++  return DarwinRegionAtOrAbove(begin, e) && e.start < begin + length;
++}
++#else
+ // Find the mapping entry in /proc/self/maps that contains the given address
+ static bool FindEntryForAddress(void* address, LinuxMapEntry& out_entry) {
+   const uintptr_t addr = reinterpret_cast<uintptr_t>(address);
+@@ -184,6 +265,7 @@ static bool IsRangeFullyMapped(void* base_address, size_t length) {
+   }
+   return cursor >= end;
+ }
++#endif  // REX_PLATFORM_MAC
+ 
+ // Convert /proc/self/maps permission chars to PageAccess
+ static PageAccess PermsToPageAccess(const char perms[5]) {
+@@ -228,6 +310,23 @@ void* AllocFixed(void* base_address, size_t length, AllocationType allocation_ty
+   if (base_address) {
+     flags |= MAP_FIXED_NOREPLACE;
+   }
++#elif REX_PLATFORM_MAC
++  // No MAP_FIXED_NOREPLACE: emulate it. A commit on an existing reservation only changes the
++  // protection (keeping committed contents, like VirtualAlloc); otherwise MAP_FIXED is only used
++  // on an address range that holds no mapping, so it never silently replaces one.
++  if (base_address) {
++    if (IsRangePartlyMapped(base_address, length)) {
++      if ((allocation_type == AllocationType::kCommit ||
++           allocation_type == AllocationType::kReserveCommit) &&
++          IsRangeFullyMapped(base_address, length) &&
++          mprotect(base_address, length, static_cast<int>(prot_requested)) == 0) {
++        return base_address;
++      }
++      errno = EEXIST;
++      return nullptr;
++    }
++    flags |= MAP_FIXED;
++  }
+ #else
+   if (base_address) {
+     flags |= MAP_FIXED;
+@@ -302,7 +401,7 @@ bool Protect(void* base_address, size_t length, PageAccess access, PageAccess* o
+ }
+ 
+ bool QueryProtect(void* base_address, size_t& length, PageAccess& access_out) {
+-#if !REX_PLATFORM_LINUX
++#if !REX_PLATFORM_LINUX && !REX_PLATFORM_MAC
+   access_out = PageAccess::kNoAccess;
+   length = 0;
+   return false;
+diff --git a/src/core/threading_posix.cpp b/src/core/threading_posix.cpp
+index 5ad3b57..9b0a4fd 100644
+--- a/src/core/threading_posix.cpp
++++ b/src/core/threading_posix.cpp
+@@ -25,8 +25,13 @@ static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only")
+ 
+ #include <pthread.h>
+ #include <semaphore.h>
++#if REX_PLATFORM_MAC
++#include <mach/mach.h>
++#include <mach/semaphore.h>
++#else
+ #include <sys/eventfd.h>
+ #include <sys/syscall.h>
++#endif
+ #include <sys/time.h>
+ #include <sys/types.h>
+ #include <unistd.h>
+@@ -60,6 +65,52 @@ static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only")
+ 
+ namespace rex::thread {
+ 
++// Suspend semaphore: posted by Resume() and waited on from the suspend signal handler, so it must
++// be async-signal-safe. Linux/Android: unnamed POSIX semaphores. Darwin does not implement
++// sem_init (it fails with ENOSYS), so use Mach semaphores, whose signal/wait are Mach traps and
++// safe in signal handlers. Return values follow sem_*: 0 on success, -1 with errno set.
++#if REX_PLATFORM_MAC
++using SuspendSem = semaphore_t;
++static inline void SuspendSemInit(SuspendSem* sem) {
++  if (semaphore_create(mach_task_self(), sem, SYNC_POLICY_FIFO, 0) != KERN_SUCCESS) {
++    *sem = MACH_PORT_NULL;
++  }
++}
++static inline void SuspendSemDestroy(SuspendSem* sem) {
++  if (*sem != MACH_PORT_NULL) {
++    semaphore_destroy(mach_task_self(), *sem);
++    *sem = MACH_PORT_NULL;
++  }
++}
++static inline int SuspendSemPost(SuspendSem* sem) {
++  return semaphore_signal(*sem) == KERN_SUCCESS ? 0 : (errno = EINVAL, -1);
++}
++static inline int SuspendSemWait(SuspendSem* sem) {
++  const kern_return_t kr = semaphore_wait(*sem);
++  if (kr == KERN_SUCCESS) {
++    return 0;
++  }
++  errno = kr == KERN_ABORTED ? EINTR : EINVAL;
++  return -1;
++}
++static inline int SuspendSemTryWait(SuspendSem* sem) {
++  const mach_timespec_t zero = {0, 0};
++  const kern_return_t kr = semaphore_timedwait(*sem, zero);
++  if (kr == KERN_SUCCESS) {
++    return 0;
++  }
++  errno = kr == KERN_ABORTED ? EINTR : EAGAIN;
++  return -1;
++}
++#else
++using SuspendSem = sem_t;
++static inline void SuspendSemInit(SuspendSem* sem) { sem_init(sem, 0, 0); }
++static inline void SuspendSemDestroy(SuspendSem* sem) { sem_destroy(sem); }
++static inline int SuspendSemPost(SuspendSem* sem) { return sem_post(sem); }
++static inline int SuspendSemWait(SuspendSem* sem) { return sem_wait(sem); }
++static inline int SuspendSemTryWait(SuspendSem* sem) { return sem_trywait(sem); }
++#endif
++
+ #if REX_PLATFORM_ANDROID
+ // May be null if no dynamically loaded functions are required.
+ static void* android_libc_;
+@@ -110,6 +161,22 @@ enum class SignalType {
+   k_Count
+ };
+ 
++#if REX_PLATFORM_MAC
++// Darwin has no real-time signals: use the two user signals (the payload is never read).
++int GetSystemSignal(SignalType num) {
++  switch (num) {
++    case SignalType::kThreadSuspend:
++      return SIGUSR1;
++    case SignalType::kThreadUserCallback:
++    default:
++      return SIGUSR2;
++  }
++}
++
++SignalType GetSystemSignalType(int num) {
++  return num == SIGUSR1 ? SignalType::kThreadSuspend : SignalType::kThreadUserCallback;
++}
++#else
+ int GetSystemSignal(SignalType num) {
+   auto result = SIGRTMIN + static_cast<int>(num);
+   assert_true(result < SIGRTMAX);
+@@ -119,6 +186,7 @@ int GetSystemSignal(SignalType num) {
+ SignalType GetSystemSignalType(int num) {
+   return static_cast<SignalType>(num - SIGRTMIN);
+ }
++#endif
+ 
+ std::array<std::atomic<bool>, static_cast<size_t>(SignalType::k_Count)> signal_handler_installed =
+     {};
+@@ -146,7 +214,13 @@ void EnableAffinityConfiguration() {}
+ // uint64_t ticks() { return mach_absolute_time(); }
+ 
+ uint32_t current_thread_system_id() {
++#if REX_PLATFORM_MAC
++  uint64_t tid = 0;
++  pthread_threadid_np(nullptr, &tid);
++  return static_cast<uint32_t>(tid);
++#else
+   return static_cast<uint32_t>(syscall(SYS_gettid));
++#endif
+ }
+ 
+ void MaybeYield() {
+@@ -584,7 +658,7 @@ class PosixCondition<Thread> : public PosixConditionBase {
+         exit_code_(0),
+         state_(State::kUninitialized),
+         suspend_count_(0) {
+-    sem_init(&suspend_sem_, 0, 0);
++    SuspendSemInit(&suspend_sem_);
+ #if REX_PLATFORM_ANDROID
+     android_pre_api_26_name_[0] = '\0';
+ #endif
+@@ -598,7 +672,7 @@ class PosixCondition<Thread> : public PosixConditionBase {
+       pthread_attr_destroy(&attr);
+       return false;
+     }
+-    if (params.initial_priority != 0) {
++    if (params.initial_priority != 0 && !REX_PLATFORM_MAC) {
+       sched_param sched{};
+       sched.sched_priority = params.initial_priority + 1;
+       if (pthread_attr_setschedpolicy(&attr, SCHED_FIFO) != 0) {
+@@ -626,7 +700,7 @@ class PosixCondition<Thread> : public PosixConditionBase {
+         exit_code_(0),
+         state_(State::kRunning),
+         suspend_count_(0) {
+-    sem_init(&suspend_sem_, 0, 0);
++    SuspendSemInit(&suspend_sem_);
+ #if REX_PLATFORM_ANDROID
+     android_pre_api_26_name_[0] = '\0';
+ #endif
+@@ -670,7 +744,13 @@ class PosixCondition<Thread> : public PosixConditionBase {
+     WaitStarted();
+     std::unique_lock<std::mutex> lock(state_mutex_);
+     if (state_ != State::kUninitialized && state_ != State::kFinished) {
++#if REX_PLATFORM_MAC
++      if (pthread_equal(thread_, pthread_self())) {
++        pthread_setname_np(std::string(name).c_str());
++      }
++#else
+       pthread_setname_np(thread_, std::string(name).c_str());
++#endif
+ #if REX_PLATFORM_ANDROID
+       SetAndroidPreApi26Name(name);
+ #endif
+@@ -688,10 +768,24 @@ class PosixCondition<Thread> : public PosixConditionBase {
+   }
+ #endif
+ 
+-  uint32_t system_id() const { return static_cast<uint32_t>(thread_); }
++  uint32_t system_id() const {
++#if REX_PLATFORM_MAC
++    // pthread_t is a pointer on Darwin; report the kernel thread ID as on Linux.
++    uint64_t tid = 0;
++    pthread_threadid_np(thread_, &tid);
++    return static_cast<uint32_t>(tid);
++#else
++    return static_cast<uint32_t>(thread_);
++#endif
++  }
+ 
+   uint64_t affinity_mask() {
+     WaitStarted();
++#if REX_PLATFORM_MAC
++    // Darwin has no thread affinity API (the scheduler places threads on P/E cores itself):
++    // report every core as allowed.
++    return ~uint64_t(0);
++#else
+     cpu_set_t cpu_set;
+ #if REX_PLATFORM_ANDROID
+     if (sched_getaffinity(pthread_gettid_np(thread_), sizeof(cpu_set_t), &cpu_set) != 0) {
+@@ -709,10 +803,14 @@ class PosixCondition<Thread> : public PosixConditionBase {
+       result |= set << i;
+     }
+     return result;
++#endif
+   }
+ 
+   void set_affinity_mask(uint64_t mask) {
+     WaitStarted();
++#if REX_PLATFORM_MAC
++    (void)mask;  // No affinity on Darwin; see affinity_mask().
++#else
+     cpu_set_t cpu_set;
+     CPU_ZERO(&cpu_set);
+     for (auto i = 0u; i < 64; i++) {
+@@ -729,6 +827,7 @@ class PosixCondition<Thread> : public PosixConditionBase {
+       assert_always();
+     }
+ #endif
++#endif  // REX_PLATFORM_MAC
+   }
+ 
+   int priority() {
+@@ -785,6 +884,9 @@ class PosixCondition<Thread> : public PosixConditionBase {
+ #if REX_PLATFORM_ANDROID
+     int result = sigqueue(pthread_gettid_np(thread_),
+                           GetSystemSignal(SignalType::kThreadUserCallback), value);
++#elif REX_PLATFORM_MAC
++    (void)value;
++    int result = pthread_kill(thread_, GetSystemSignal(SignalType::kThreadUserCallback));
+ #else
+     int result = pthread_sigqueue(thread_, GetSystemSignal(SignalType::kThreadUserCallback), value);
+ #endif
+@@ -831,7 +933,7 @@ class PosixCondition<Thread> : public PosixConditionBase {
+     if (suspend_count_ == 0 && state_ == State::kSuspended) {
+       state_ = State::kRunning;
+       // Async-signal-safe wakeup for WaitSuspended() from signal handler path.
+-      sem_post(&suspend_sem_);
++      SuspendSemPost(&suspend_sem_);
+     }
+     state_signal_.notify_all();
+     return true;
+@@ -910,7 +1012,7 @@ class PosixCondition<Thread> : public PosixConditionBase {
+   void WaitSuspended() {
+     int ret;
+     do {
+-      ret = sem_wait(&suspend_sem_);
++      ret = SuspendSemWait(&suspend_sem_);
+     } while (ret == -1 && errno == EINTR);
+   }
+ 
+@@ -923,14 +1025,14 @@ class PosixCondition<Thread> : public PosixConditionBase {
+     if (thread_) {
+       pthread_join(thread_, nullptr);
+     }
+-    sem_destroy(&suspend_sem_);
++    SuspendSemDestroy(&suspend_sem_);
+   }
+   pthread_t thread_;
+   bool signaled_;
+   int exit_code_;
+   State state_;             // Protected by state_mutex_
+   uint32_t suspend_count_;  // Protected by state_mutex_
+-  sem_t suspend_sem_;
++  SuspendSem suspend_sem_;
+   mutable std::mutex state_mutex_;
+   mutable std::mutex callback_mutex_;
+   mutable std::condition_variable state_signal_;
+@@ -1350,11 +1452,11 @@ void* PosixCondition<Thread>::ThreadStartRoutine(void* parameter) {
+       // variable above, but must not leave a token for a later signal wait.
+       int result;
+       do {
+-        result = sem_trywait(&thread->handle_.suspend_sem_);
++        result = SuspendSemTryWait(&thread->handle_.suspend_sem_);
+       } while (result == -1 && errno == EINTR);
+       while (result == 0) {
+         do {
+-          result = sem_trywait(&thread->handle_.suspend_sem_);
++          result = SuspendSemTryWait(&thread->handle_.suspend_sem_);
+         } while (result == -1 && errno == EINTR);
+       }
+     }
+@@ -1432,7 +1534,11 @@ void Thread::Exit(int exit_code) {
+ }
+ 
+ void set_current_thread_name(const std::string_view name) {
++#if REX_PLATFORM_MAC
++  pthread_setname_np(std::string(name).c_str());
++#else
+   pthread_setname_np(pthread_self(), std::string(name).c_str());
++#endif
+ #if REX_PLATFORM_ANDROID
+   if (!android_pthread_getname_np_ && current_thread_) {
+     current_thread_->condition().SetAndroidPreApi26Name(name);
+diff --git a/src/ui/CMakeLists.txt b/src/ui/CMakeLists.txt
+index bae5da5..ead7f32 100644
+--- a/src/ui/CMakeLists.txt
++++ b/src/ui/CMakeLists.txt
+@@ -61,6 +61,13 @@ if(WIN32)
+         window_win.cpp
+         windowed_app_context_win.cpp
+     )
++elseif(APPLE)
++    # macOS / iOS: SDL3 window + CAMetalLayer, presented by MoltenVK (VK_EXT_metal_surface).
++    set(REXUI_PLATFORM_SOURCES
++        surface_apple.cpp
++        window_sdl.cpp
++        windowed_app_context_sdl.cpp
++    )
+ else()
+     set(REXUI_PLATFORM_SOURCES
+         surface_gnulinux.cpp
+@@ -139,6 +146,8 @@ if(WIN32)
+         shcore
+         dxgi
+     )
++elseif(APPLE)
++    target_link_libraries(rexui PUBLIC SDL3::SDL3)
+ else()
+     find_package(PkgConfig REQUIRED)
+     pkg_check_modules(GTK3 REQUIRED gtk+-3.0)
+diff --git a/src/ui/surface_apple.cpp b/src/ui/surface_apple.cpp
+new file mode 100644
+index 0000000..7f29b6f
+--- /dev/null
++++ b/src/ui/surface_apple.cpp
+@@ -0,0 +1,25 @@
++/**
++ * ReXGlue Apple (macOS / iOS) presentation surface.
++ */
++
++#include <rex/ui/surface_apple.h>
++
++#include <SDL3/SDL.h>
++
++namespace rex {
++namespace ui {
++
++bool MetalLayerSurface::GetSizeImpl(uint32_t& width_out, uint32_t& height_out) const {
++  // Size in pixels (backing store), not points: the swapchain must match the layer's drawable.
++  int width = 0, height = 0;
++  if (!window_ || !SDL_GetWindowSizeInPixels(window_, &width, &height) || width <= 0 ||
++      height <= 0) {
++    return false;
++  }
++  width_out = uint32_t(width);
++  height_out = uint32_t(height);
++  return true;
++}
++
++}  // namespace ui
++}  // namespace rex
+diff --git a/src/ui/vulkan/vulkan_instance.cpp b/src/ui/vulkan/vulkan_instance.cpp
+index 57a43fb..22b74fe 100644
+--- a/src/ui/vulkan/vulkan_instance.cpp
++++ b/src/ui/vulkan/vulkan_instance.cpp
+@@ -118,6 +118,11 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(const bool with_surface,
+     // #10.
+     requested_extensions.emplace("VK_KHR_win32_surface",
+                                  &vulkan_instance->extensions_.ext_KHR_win32_surface);
++#endif
++#ifdef VK_USE_PLATFORM_METAL_EXT
++    // #218.
++    requested_extensions.emplace("VK_EXT_metal_surface",
++                                 &vulkan_instance->extensions_.ext_EXT_metal_surface);
+ #endif
+   }
+ 
+@@ -381,6 +386,11 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(const bool with_surface,
+   if (vulkan_instance->extensions_.ext_KHR_win32_surface) {
+ #include <rex/ui/vulkan/functions/instance_khr_win32_surface.inc>
+   }
++#endif
++#ifdef VK_USE_PLATFORM_METAL_EXT
++  if (vulkan_instance->extensions_.ext_EXT_metal_surface) {
++#include <rex/ui/vulkan/functions/instance_ext_metal_surface.inc>
++  }
+ #endif
+   if (vulkan_instance->extensions_.ext_KHR_surface) {
+ #include <rex/ui/vulkan/functions/instance_khr_surface.inc>
+diff --git a/src/ui/vulkan/vulkan_presenter.cpp b/src/ui/vulkan/vulkan_presenter.cpp
+index 2f2c99a..e884a05 100644
+--- a/src/ui/vulkan/vulkan_presenter.cpp
++++ b/src/ui/vulkan/vulkan_presenter.cpp
+@@ -42,6 +42,9 @@
+ #if REX_PLATFORM_WIN32
+ #include <rex/ui/surface_win.h>
+ #endif
++#if REX_PLATFORM_MAC
++#include <rex/ui/surface_apple.h>
++#endif
+ 
+ REXCVAR_DEFINE_BOOL(present_render_pass_clear, true, "UI/Presenter",
+                     "Clear render pass during presentation");
+@@ -434,6 +437,11 @@ Surface::TypeFlags VulkanPresenter::GetSurfaceTypesSupportedByInstance(
+   if (instance_extensions.ext_KHR_win32_surface) {
+     type_flags |= Surface::kTypeFlag_Win32Hwnd;
+   }
++#endif
++#if REX_PLATFORM_MAC
++  if (instance_extensions.ext_EXT_metal_surface) {
++    type_flags |= Surface::kTypeFlag_MetalLayer;
++  }
+ #endif
+   return type_flags;
+ }
+@@ -827,6 +835,18 @@ VulkanPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_su
+         vulkan_surface_create_result = ifn.vkCreateWin32SurfaceKHR(
+             instance, &surface_create_info, nullptr, &paint_context_.vulkan_surface);
+       } break;
++#endif
++#if REX_PLATFORM_MAC
++      case Surface::kTypeIndex_MetalLayer: {
++        auto& metal_layer_surface = static_cast<const MetalLayerSurface&>(new_surface);
++        VkMetalSurfaceCreateInfoEXT surface_create_info;
++        surface_create_info.sType = VK_STRUCTURE_TYPE_METAL_SURFACE_CREATE_INFO_EXT;
++        surface_create_info.pNext = nullptr;
++        surface_create_info.flags = 0;
++        surface_create_info.pLayer = static_cast<const CAMetalLayer*>(metal_layer_surface.layer());
++        vulkan_surface_create_result = ifn.vkCreateMetalSurfaceEXT(
++            instance, &surface_create_info, nullptr, &paint_context_.vulkan_surface);
++      } break;
+ #endif
+       default:
+         assert_unhandled_case(surface_type);
+diff --git a/src/ui/window_sdl.cpp b/src/ui/window_sdl.cpp
+new file mode 100644
+index 0000000..8140e2e
+--- /dev/null
++++ b/src/ui/window_sdl.cpp
+@@ -0,0 +1,682 @@
++/**
++ * ReXGlue SDL3 window (macOS / iOS).
++ */
++
++#include <rex/ui/window_sdl.h>
++
++#include <algorithm>
++#include <cmath>
++#include <string>
++
++#include <rex/assert.h>
++#include <rex/cvar.h>
++#include <rex/graphics/flags.h>
++#include <rex/graphics/video_mode_util.h>
++#include <rex/logging.h>
++#include <rex/platform.h>
++#include <rex/ui/clipboard.h>
++#include <rex/ui/flags.h>
++#include <rex/ui/surface_apple.h>
++#include <rex/ui/ui_event.h>
++#include <rex/ui/virtual_key.h>
++#include <rex/ui/windowed_app_context_sdl.h>
++
++#include <SDL3/SDL.h>
++#include <SDL3/SDL_metal.h>
++
++namespace {
++
++// Same window size resolution as the GTK and Win32 windows: window_width/height win, then the
++// video mode, then the resolution preset, then what the app asked for.
++uint32_t ResolveWindowWidth(uint32_t requested_width) {
++  if (REXCVAR_GET(window_width) > 0) {
++    return uint32_t(REXCVAR_GET(window_width));
++  }
++  if (!rex::cvar::HasNonDefaultValue("window_width")) {
++    if (rex::cvar::HasNonDefaultValue("video_mode_width") && REXCVAR_GET(video_mode_width) > 0) {
++      return uint32_t(std::clamp(REXCVAR_GET(video_mode_width), 1, 8192));
++    }
++    int32_t preset_width = 0;
++    int32_t preset_height = 0;
++    if (rex::graphics::video_mode_util::TryGetResolutionPresetFromCVar(preset_width,
++                                                                       preset_height)) {
++      return uint32_t(std::clamp(preset_width, 1, 8192));
++    }
++  }
++  return requested_width;
++}
++
++uint32_t ResolveWindowHeight(uint32_t requested_height) {
++  if (REXCVAR_GET(window_height) > 0) {
++    return uint32_t(REXCVAR_GET(window_height));
++  }
++  if (!rex::cvar::HasNonDefaultValue("window_height")) {
++    if (rex::cvar::HasNonDefaultValue("video_mode_height") && REXCVAR_GET(video_mode_height) > 0) {
++      return uint32_t(std::clamp(REXCVAR_GET(video_mode_height), 1, 8192));
++    }
++    int32_t preset_width = 0;
++    int32_t preset_height = 0;
++    if (rex::graphics::video_mode_util::TryGetResolutionPresetFromCVar(preset_width,
++                                                                       preset_height)) {
++      return uint32_t(std::clamp(preset_height, 1, 8192));
++    }
++  }
++  return requested_height;
++}
++
++using rex::ui::VirtualKey;
++
++VirtualKey TranslateSDLKeycodeToVirtualKey(SDL_Keycode key) {
++  if (key >= SDLK_A && key <= SDLK_Z) {
++    return VirtualKey(uint16_t(VirtualKey::kA) + uint16_t(key - SDLK_A));
++  }
++  if (key >= SDLK_0 && key <= SDLK_9) {
++    return VirtualKey(uint16_t(VirtualKey::k0) + uint16_t(key - SDLK_0));
++  }
++  if (key >= SDLK_F1 && key <= SDLK_F12) {
++    return VirtualKey(uint16_t(VirtualKey::kF1) + uint16_t(key - SDLK_F1));
++  }
++  if (key >= SDLK_F13 && key <= SDLK_F24) {
++    return VirtualKey(uint16_t(VirtualKey::kF13) + uint16_t(key - SDLK_F13));
++  }
++  if (key >= SDLK_KP_1 && key <= SDLK_KP_9) {
++    return VirtualKey(uint16_t(VirtualKey::kNumpad1) + uint16_t(key - SDLK_KP_1));
++  }
++  switch (key) {
++    case SDLK_KP_0:
++      return VirtualKey::kNumpad0;
++    case SDLK_ESCAPE:
++      return VirtualKey::kEscape;
++    case SDLK_RETURN:
++    case SDLK_RETURN2:
++    case SDLK_KP_ENTER:
++      return VirtualKey::kReturn;
++    case SDLK_SPACE:
++    case SDLK_KP_SPACE:
++      return VirtualKey::kSpace;
++    case SDLK_TAB:
++    case SDLK_KP_TAB:
++      return VirtualKey::kTab;
++    case SDLK_BACKSPACE:
++    case SDLK_KP_BACKSPACE:
++      return VirtualKey::kBack;
++    case SDLK_DELETE:
++      return VirtualKey::kDelete;
++    case SDLK_INSERT:
++      return VirtualKey::kInsert;
++    case SDLK_HOME:
++      return VirtualKey::kHome;
++    case SDLK_END:
++      return VirtualKey::kEnd;
++    case SDLK_PAGEUP:
++      return VirtualKey::kPrior;
++    case SDLK_PAGEDOWN:
++      return VirtualKey::kNext;
++    case SDLK_LEFT:
++      return VirtualKey::kLeft;
++    case SDLK_RIGHT:
++      return VirtualKey::kRight;
++    case SDLK_UP:
++      return VirtualKey::kUp;
++    case SDLK_DOWN:
++      return VirtualKey::kDown;
++    case SDLK_LSHIFT:
++    case SDLK_RSHIFT:
++      return VirtualKey::kShift;
++    case SDLK_LCTRL:
++    case SDLK_RCTRL:
++      return VirtualKey::kControl;
++    case SDLK_LALT:
++    case SDLK_RALT:
++      return VirtualKey::kMenu;
++    case SDLK_LGUI:
++      return VirtualKey::kLWin;
++    case SDLK_RGUI:
++      return VirtualKey::kRWin;
++    case SDLK_APPLICATION:
++      return VirtualKey::kApps;
++    case SDLK_CAPSLOCK:
++      return VirtualKey::kCapital;
++    case SDLK_NUMLOCKCLEAR:
++      return VirtualKey::kNumLock;
++    case SDLK_SCROLLLOCK:
++      return VirtualKey::kScroll;
++    case SDLK_PRINTSCREEN:
++      return VirtualKey::kSnapshot;
++    case SDLK_PAUSE:
++      return VirtualKey::kPause;
++    case SDLK_KP_PLUS:
++      return VirtualKey::kAdd;
++    case SDLK_KP_MINUS:
++      return VirtualKey::kSubtract;
++    case SDLK_KP_MULTIPLY:
++      return VirtualKey::kMultiply;
++    case SDLK_KP_DIVIDE:
++      return VirtualKey::kDivide;
++    case SDLK_KP_PERIOD:
++    case SDLK_KP_DECIMAL:
++      return VirtualKey::kDecimal;
++    case SDLK_GRAVE:
++      return VirtualKey::kOem3;
++    case SDLK_MINUS:
++      return VirtualKey::kOemMinus;
++    case SDLK_EQUALS:
++    case SDLK_PLUS:
++      return VirtualKey::kOemPlus;
++    case SDLK_COMMA:
++      return VirtualKey::kOemComma;
++    case SDLK_PERIOD:
++      return VirtualKey::kOemPeriod;
++    case SDLK_SEMICOLON:
++    case SDLK_COLON:
++      return VirtualKey::kOem1;
++    case SDLK_SLASH:
++    case SDLK_QUESTION:
++      return VirtualKey::kOem2;
++    case SDLK_BACKSLASH:
++      return VirtualKey::kOem5;
++    case SDLK_LEFTBRACKET:
++      return VirtualKey::kOem4;
++    case SDLK_RIGHTBRACKET:
++      return VirtualKey::kOem6;
++    case SDLK_APOSTROPHE:
++    case SDLK_DBLAPOSTROPHE:
++      return VirtualKey::kOem7;
++    default:
++      return VirtualKey::kNone;
++  }
++}
++
++// Decodes one UTF-8 code point; returns 0 at the end or on malformed input.
++uint32_t NextUtf8CodePoint(const char*& p) {
++  const auto c0 = uint8_t(*p);
++  if (!c0) {
++    return 0;
++  }
++  int extra;
++  uint32_t cp;
++  if (c0 < 0x80) {
++    ++p;
++    return c0;
++  } else if ((c0 & 0xE0) == 0xC0) {
++    extra = 1;
++    cp = c0 & 0x1F;
++  } else if ((c0 & 0xF0) == 0xE0) {
++    extra = 2;
++    cp = c0 & 0x0F;
++  } else if ((c0 & 0xF8) == 0xF0) {
++    extra = 3;
++    cp = c0 & 0x07;
++  } else {
++    return 0;
++  }
++  ++p;
++  for (int i = 0; i < extra; ++i) {
++    const auto c = uint8_t(*p);
++    if ((c & 0xC0) != 0x80) {
++      return 0;
++    }
++    cp = (cp << 6) | (c & 0x3F);
++    ++p;
++  }
++  return cp;
++}
++
++}  // namespace
++
++namespace rex {
++namespace ui {
++
++std::optional<std::u16string> GetClipboardText() {
++  char* text = SDL_GetClipboardText();
++  if (!text) {
++    return std::nullopt;
++  }
++  std::u16string result;
++  const char* p = text;
++  while (uint32_t cp = NextUtf8CodePoint(p)) {
++    if (cp >= 0x10000) {
++      cp -= 0x10000;
++      result.push_back(char16_t(0xD800 + (cp >> 10)));
++      result.push_back(char16_t(0xDC00 + (cp & 0x3FF)));
++    } else {
++      result.push_back(char16_t(cp));
++    }
++  }
++  SDL_free(text);
++  return result;
++}
++
++std::unique_ptr<Window> Window::Create(WindowedAppContext& app_context,
++                                       const std::string_view title, uint32_t desired_logical_width,
++                                       uint32_t desired_logical_height) {
++  desired_logical_width = ResolveWindowWidth(desired_logical_width);
++  desired_logical_height = ResolveWindowHeight(desired_logical_height);
++  return std::make_unique<SDLWindow>(app_context, title, desired_logical_width,
++                                     desired_logical_height);
++}
++
++std::unique_ptr<ui::MenuItem> MenuItem::Create(Type type, const std::string& text,
++                                               const std::string& hotkey,
++                                               std::function<void()> callback) {
++  return std::make_unique<SDLMenuItem>(type, text, hotkey, std::move(callback));
++}
++
++SDLWindow::SDLWindow(WindowedAppContext& app_context, const std::string_view title,
++                     uint32_t desired_logical_width, uint32_t desired_logical_height)
++    : Window(app_context, title, desired_logical_width, desired_logical_height) {}
++
++SDLWindow::~SDLWindow() {
++  EnterDestructor();
++  if (window_) {
++    sdl_app_context().UnregisterWindow(window_id_);
++    if (metal_view_) {
++      SDL_Metal_DestroyView(static_cast<SDL_MetalView>(metal_view_));
++      metal_view_ = nullptr;
++      metal_layer_ = nullptr;
++    }
++    SDL_Window* window = window_;
++    window_ = nullptr;
++    SDL_DestroyWindow(window);
++  }
++}
++
++SDLWindowedAppContext& SDLWindow::sdl_app_context() const {
++  return static_cast<SDLWindowedAppContext&>(app_context());
++}
++
++uint32_t SDLWindow::GetLatestDpiImpl() const {
++  if (!window_) {
++    return 0;
++  }
++  // Window coordinates are reported in pixels, so the effective DPI scales with the density.
++  const float density = SDL_GetWindowPixelDensity(window_);
++  return density > 0.0f ? uint32_t(std::lround(GetMediumDpi() * density)) : 0;
++}
++
++bool SDLWindow::OpenImpl() {
++  SDL_WindowFlags flags = SDL_WINDOW_METAL | SDL_WINDOW_HIGH_PIXEL_DENSITY | SDL_WINDOW_RESIZABLE;
++#if defined(TARGET_OS_IOS) && TARGET_OS_IOS
++  // iOS apps always cover the screen.
++  flags |= SDL_WINDOW_FULLSCREEN | SDL_WINDOW_BORDERLESS;
++#else
++  if (IsFullscreen()) {
++    flags |= SDL_WINDOW_FULLSCREEN;
++  }
++#endif
++  window_ = SDL_CreateWindow(GetTitle().c_str(), int(GetDesiredLogicalWidth()),
++                             int(GetDesiredLogicalHeight()), flags);
++  if (!window_) {
++    REXLOG_ERROR("SDLWindow: SDL_CreateWindow failed: {}", SDL_GetError());
++    return false;
++  }
++  window_id_ = SDL_GetWindowID(window_);
++
++  SDL_MetalView metal_view = SDL_Metal_CreateView(window_);
++  if (!metal_view) {
++    REXLOG_ERROR("SDLWindow: SDL_Metal_CreateView failed: {}", SDL_GetError());
++    SDL_DestroyWindow(window_);
++    window_ = nullptr;
++    return false;
++  }
++  metal_view_ = metal_view;
++  metal_layer_ = SDL_Metal_GetLayer(metal_view);
++
++  // Move to the requested monitor (1-based, as on the other platforms).
++  if (int32_t monitor_index = REXCVAR_GET(monitor); monitor_index > 0) {
++    int display_count = 0;
++    SDL_DisplayID* displays = SDL_GetDisplays(&display_count);
++    if (displays) {
++      if (monitor_index <= display_count) {
++        SDL_DisplayID display = displays[monitor_index - 1];
++        SDL_SetWindowPosition(window_, SDL_WINDOWPOS_CENTERED_DISPLAY(display),
++                              SDL_WINDOWPOS_CENTERED_DISPLAY(display));
++      }
++      SDL_free(displays);
++    }
++  }
++
++  sdl_app_context().RegisterWindow(window_id_, this);
++
++  // Text input delivers typed characters (OnKeyChar) for the in-game keyboard and Ctrl+V paste.
++  SDL_StartTextInput(window_);
++
++  SDL_ShowWindow(window_);
++
++  // Report the initial state regardless of which events SDL sends first.
++  {
++    WindowDestructionReceiver destruction_receiver(this);
++    ReportActualSize(destruction_receiver);
++    if (destruction_receiver.IsWindowDestroyedOrClosed()) {
++      return true;
++    }
++    if (SDL_GetWindowFlags(window_) & SDL_WINDOW_INPUT_FOCUS) {
++      OnFocusUpdate(true, destruction_receiver);
++      if (destruction_receiver.IsWindowDestroyedOrClosed()) {
++        return true;
++      }
++    }
++  }
++  return true;
++}
++
++void SDLWindow::RequestCloseImpl() {
++  CloseFromSDL();
++}
++
++void SDLWindow::HandleQuitRequest() {
++  CloseFromSDL();
++}
++
++void SDLWindow::CloseFromSDL() {
++  if (!window_) {
++    return;
++  }
++  WindowDestructionReceiver destruction_receiver(this);
++  OnBeforeClose(destruction_receiver);
++  if (destruction_receiver.IsWindowDestroyed()) {
++    return;
++  }
++  sdl_app_context().UnregisterWindow(window_id_);
++  if (metal_view_) {
++    SDL_Metal_DestroyView(static_cast<SDL_MetalView>(metal_view_));
++    metal_view_ = nullptr;
++    metal_layer_ = nullptr;
++  }
++  SDL_Window* window = window_;
++  window_ = nullptr;
++  SDL_DestroyWindow(window);
++  OnAfterClose();
++}
++
++void SDLWindow::ApplyNewFullscreen() {
++#if !(defined(TARGET_OS_IOS) && TARGET_OS_IOS)
++  WindowDestructionReceiver destruction_receiver(this);
++  // Borderless "desktop" fullscreen (no display mode change), which also behaves well with
++  // Spaces on macOS.
++  SDL_SetWindowFullscreenMode(window_, nullptr);
++  SDL_SetWindowFullscreen(window_, IsFullscreen());
++  SDL_SyncWindow(window_);
++  ReportActualSize(destruction_receiver);
++#endif
++}
++
++void SDLWindow::ApplyNewTitle() {
++  SDL_SetWindowTitle(window_, GetTitle().c_str());
++}
++
++void SDLWindow::FocusImpl() {
++  SDL_RaiseWindow(window_);
++}
++
++void SDLWindow::ApplyCursorHidden(bool hidden) {
++  if (hidden == cursor_hidden_) {
++    return;
++  }
++  cursor_hidden_ = hidden;
++  if (hidden) {
++    SDL_HideCursor();
++  } else {
++    SDL_ShowCursor();
++  }
++}
++
++void SDLWindow::ApplyNewCursorVisibility(CursorVisibility old_cursor_visibility) {
++  (void)old_cursor_visibility;
++  switch (GetCursorVisibility()) {
++    case CursorVisibility::kVisible:
++      ApplyCursorHidden(false);
++      break;
++    case CursorVisibility::kHidden:
++    case CursorVisibility::kAutoHidden:
++      // Entering auto-hide hides the cursor at once; movement reveals it (see HandleMouse).
++      ApplyCursorHidden(true);
++      break;
++  }
++}
++
++std::unique_ptr<Surface> SDLWindow::CreateSurfaceImpl(Surface::TypeFlags allowed_types) {
++  if ((allowed_types & Surface::kTypeFlag_MetalLayer) && metal_layer_) {
++    return std::make_unique<MetalLayerSurface>(window_, metal_layer_);
++  }
++  REXLOG_ERROR("SDLWindow: no supported surface type (need a Metal layer for MoltenVK)");
++  return nullptr;
++}
++
++void SDLWindow::RequestPaintImpl() {
++  if (window_) {
++    sdl_app_context().RequestPaint(window_id_);
++  }
++}
++
++void SDLWindow::HandlePaintEvent() {
++  if (!window_) {
++    return;
++  }
++  // Cursor auto-hide check rides on paints, which keep coming while the game runs.
++  if (GetCursorVisibility() == CursorVisibility::kAutoHidden && !cursor_hidden_ &&
++      SDL_GetTicks() - cursor_last_activity_ms_ >= kDefaultCursorAutoHideMilliseconds) {
++    ApplyCursorHidden(true);
++  }
++  OnPaint();
++}
++
++void SDLWindow::ReportActualSize(WindowDestructionReceiver& destruction_receiver) {
++  int width = 0, height = 0;
++  if (!SDL_GetWindowSizeInPixels(window_, &width, &height)) {
++    return;
++  }
++  OnActualSizeUpdate(uint32_t(std::max(width, 0)), uint32_t(std::max(height, 0)),
++                     destruction_receiver);
++}
++
++void SDLWindow::HandleEvent(const SDL_Event& event) {
++  if (!window_) {
++    return;
++  }
++  WindowDestructionReceiver destruction_receiver(this);
++  switch (event.type) {
++    case SDL_EVENT_WINDOW_CLOSE_REQUESTED:
++      CloseFromSDL();
++      return;
++    case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED:
++    case SDL_EVENT_WINDOW_RESIZED:
++    case SDL_EVENT_WINDOW_ENTER_FULLSCREEN:
++    case SDL_EVENT_WINDOW_LEAVE_FULLSCREEN:
++      if (event.type == SDL_EVENT_WINDOW_ENTER_FULLSCREEN ||
++          event.type == SDL_EVENT_WINDOW_LEAVE_FULLSCREEN) {
++        // Keep the Window's notion in sync when the user toggles it from the OS (green button).
++        OnDesiredFullscreenUpdate(event.type == SDL_EVENT_WINDOW_ENTER_FULLSCREEN);
++      }
++      ReportActualSize(destruction_receiver);
++      if (!destruction_receiver.IsWindowDestroyedOrClosed()) {
++        RequestPaint();
++      }
++      return;
++    case SDL_EVENT_WINDOW_DISPLAY_SCALE_CHANGED: {
++      UISetupEvent e(this);
++      OnDpiChanged(e, destruction_receiver);
++      if (!destruction_receiver.IsWindowDestroyedOrClosed()) {
++        ReportActualSize(destruction_receiver);
++      }
++      return;
++    }
++    case SDL_EVENT_WINDOW_DISPLAY_CHANGED: {
++      MonitorUpdateEvent e(this, false);
++      OnMonitorUpdate(e);
++      return;
++    }
++    case SDL_EVENT_WINDOW_EXPOSED:
++      OnPaint();
++      return;
++    case SDL_EVENT_WINDOW_FOCUS_GAINED:
++      OnFocusUpdate(true, destruction_receiver);
++      return;
++    case SDL_EVENT_WINDOW_FOCUS_LOST:
++      OnFocusUpdate(false, destruction_receiver);
++      return;
++    case SDL_EVENT_KEY_DOWN:
++    case SDL_EVENT_KEY_UP:
++    case SDL_EVENT_TEXT_INPUT:
++      HandleKeyboard(event, destruction_receiver);
++      return;
++    case SDL_EVENT_MOUSE_MOTION:
++    case SDL_EVENT_MOUSE_BUTTON_DOWN:
++    case SDL_EVENT_MOUSE_BUTTON_UP:
++    case SDL_EVENT_MOUSE_WHEEL:
++      HandleMouse(event, destruction_receiver);
++      return;
++    case SDL_EVENT_FINGER_DOWN:
++    case SDL_EVENT_FINGER_UP:
++    case SDL_EVENT_FINGER_MOTION:
++    case SDL_EVENT_FINGER_CANCELED:
++      HandleTouch(event, destruction_receiver);
++      return;
++    case SDL_EVENT_DROP_FILE:
++      if (event.drop.data) {
++        FileDropEvent e(this, std::filesystem::path(event.drop.data));
++        OnFileDrop(e, destruction_receiver);
++      }
++      return;
++    default:
++      return;
++  }
++}
++
++void SDLWindow::HandleKeyboard(const SDL_Event& event,
++                               WindowDestructionReceiver& destruction_receiver) {
++  const SDL_Keymod mod = SDL_GetModState();
++  const bool shift = mod & SDL_KMOD_SHIFT;
++  const bool ctrl = mod & SDL_KMOD_CTRL;
++  const bool alt = mod & SDL_KMOD_ALT;
++  const bool super = mod & SDL_KMOD_GUI;
++  if (event.type == SDL_EVENT_TEXT_INPUT) {
++    // One OnKeyChar per code point, as GTK and Win32 deliver them.
++    const char* p = event.text.text;
++    while (p) {
++      const uint32_t cp = NextUtf8CodePoint(p);
++      if (!cp) {
++        break;
++      }
++      if (cp > 0xFFFF) {
++        continue;  // VirtualKey is 16-bit; the game's keyboard has no characters outside the BMP.
++      }
++      KeyEvent char_event(this, VirtualKey(uint16_t(cp)), 1, false, shift, ctrl, alt, super);
++      OnKeyChar(char_event, destruction_receiver);
++      if (destruction_receiver.IsWindowDestroyedOrClosed()) {
++        return;
++      }
++    }
++    return;
++  }
++  const bool down = event.type == SDL_EVENT_KEY_DOWN;
++  KeyEvent e(this, TranslateSDLKeycodeToVirtualKey(event.key.key), 1,
++             down ? event.key.repeat : true, shift, ctrl, alt, super);
++  if (down) {
++    OnKeyDown(e, destruction_receiver);
++  } else {
++    OnKeyUp(e, destruction_receiver);
++  }
++}
++
++void SDLWindow::HandleMouse(const SDL_Event& event,
++                            WindowDestructionReceiver& destruction_receiver) {
++  // SDL reports window coordinates in points; convert to pixels to match the reported size.
++  const float density = std::max(SDL_GetWindowPixelDensity(window_), 1.0f);
++  MouseEvent::Button button = MouseEvent::Button::kNone;
++  float x = 0.0f, y = 0.0f;
++  int32_t scroll_x = 0, scroll_y = 0;
++  switch (event.type) {
++    case SDL_EVENT_MOUSE_MOTION:
++      x = event.motion.x;
++      y = event.motion.y;
++      break;
++    case SDL_EVENT_MOUSE_BUTTON_DOWN:
++    case SDL_EVENT_MOUSE_BUTTON_UP:
++      switch (event.button.button) {
++        case SDL_BUTTON_LEFT:
++          button = MouseEvent::Button::kLeft;
++          break;
++        case SDL_BUTTON_MIDDLE:
++          button = MouseEvent::Button::kMiddle;
++          break;
++        case SDL_BUTTON_RIGHT:
++          button = MouseEvent::Button::kRight;
++          break;
++        case SDL_BUTTON_X1:
++          button = MouseEvent::Button::kX1;
++          break;
++        case SDL_BUTTON_X2:
++          button = MouseEvent::Button::kX2;
++          break;
++        default:
++          break;
++      }
++      x = event.button.x;
++      y = event.button.y;
++      break;
++    case SDL_EVENT_MOUSE_WHEEL: {
++      x = event.wheel.mouse_x;
++      y = event.wheel.mouse_y;
++      const float sign = event.wheel.direction == SDL_MOUSEWHEEL_FLIPPED ? -1.0f : 1.0f;
++      scroll_x = int32_t(std::lround(sign * event.wheel.x * MouseEvent::kScrollPerDetent));
++      // SDL: positive y is away from the user, as the Window API expects.
++      scroll_y = int32_t(std::lround(sign * event.wheel.y * MouseEvent::kScrollPerDetent));
++    } break;
++    default:
++      return;
++  }
++
++  // Any real mouse activity reveals an auto-hidden cursor and restarts its timer.
++  cursor_last_activity_ms_ = SDL_GetTicks();
++  if (GetCursorVisibility() == CursorVisibility::kAutoHidden) {
++    ApplyCursorHidden(false);
++  }
++
++  MouseEvent e(this, button, int32_t(std::lround(x * density)), int32_t(std::lround(y * density)),
++               scroll_x, scroll_y);
++  switch (event.type) {
++    case SDL_EVENT_MOUSE_MOTION:
++      OnMouseMove(e, destruction_receiver);
++      break;
++    case SDL_EVENT_MOUSE_BUTTON_DOWN:
++      OnMouseDown(e, destruction_receiver);
++      break;
++    case SDL_EVENT_MOUSE_BUTTON_UP:
++      OnMouseUp(e, destruction_receiver);
++      break;
++    case SDL_EVENT_MOUSE_WHEEL:
++      OnMouseWheel(e, destruction_receiver);
++      break;
++    default:
++      break;
++  }
++}
++
++void SDLWindow::HandleTouch(const SDL_Event& event,
++                            WindowDestructionReceiver& destruction_receiver) {
++  // SDL finger coordinates are normalized (0..1) to the window; the Window API wants pixels.
++  int width = 0, height = 0;
++  SDL_GetWindowSizeInPixels(window_, &width, &height);
++  TouchEvent::Action action;
++  switch (event.type) {
++    case SDL_EVENT_FINGER_DOWN:
++      action = TouchEvent::Action::kDown;
++      break;
++    case SDL_EVENT_FINGER_UP:
++      action = TouchEvent::Action::kUp;
++      break;
++    case SDL_EVENT_FINGER_CANCELED:
++      action = TouchEvent::Action::kCancel;
++      break;
++    default:
++      action = TouchEvent::Action::kMove;
++      break;
++  }
++  TouchEvent e(this, uint32_t(event.tfinger.fingerID), action, event.tfinger.x * float(width),
++               event.tfinger.y * float(height));
++  OnTouchEvent(e, destruction_receiver);
++}
++
++}  // namespace ui
++}  // namespace rex
+diff --git a/src/ui/windowed_app_context_sdl.cpp b/src/ui/windowed_app_context_sdl.cpp
+new file mode 100644
+index 0000000..e392259
+--- /dev/null
++++ b/src/ui/windowed_app_context_sdl.cpp
+@@ -0,0 +1,192 @@
++/**
++ * ReXGlue SDL3 windowed app context (macOS / iOS).
++ */
++
++#include <rex/ui/windowed_app_context_sdl.h>
++
++#include <cstdio>
++
++#include <rex/assert.h>
++#include <rex/ui/window_sdl.h>
++
++#include <SDL3/SDL.h>
++
++namespace rex {
++namespace ui {
++
++SDLWindowedAppContext::SDLWindowedAppContext() = default;
++
++SDLWindowedAppContext::~SDLWindowedAppContext() {
++  if (sdl_initialized_) {
++    SDL_QuitSubSystem(SDL_INIT_VIDEO | SDL_INIT_EVENTS);
++  }
++}
++
++bool SDLWindowedAppContext::Initialize() {
++  if (sdl_initialized_) {
++    return true;
++  }
++  // Keep the game running at full speed when the window is in the background (matches the other
++  // platforms); the user pauses from inside the game.
++  SDL_SetHint(SDL_HINT_VIDEO_MINIMIZE_ON_FOCUS_LOSS, "0");
++  if (!SDL_InitSubSystem(SDL_INIT_VIDEO | SDL_INIT_EVENTS)) {
++    std::fprintf(stderr, "Failed to initialize SDL video: %s\n", SDL_GetError());
++    return false;
++  }
++  sdl_initialized_ = true;
++  const Uint32 first_event = SDL_RegisterEvents(2);
++  if (!first_event) {
++    std::fprintf(stderr, "Failed to register SDL events: %s\n", SDL_GetError());
++    return false;
++  }
++  pending_functions_event_type_ = first_event;
++  paint_event_type_ = first_event + 1;
++  return true;
++}
++
++void SDLWindowedAppContext::NotifyUILoopOfPendingFunctions() {
++  // Any thread. One queued wake-up is enough: the handler drains every pending function.
++  if (pending_functions_event_queued_.exchange(true)) {
++    return;
++  }
++  SDL_Event event;
++  SDL_zero(event);
++  event.type = pending_functions_event_type_;
++  if (!SDL_PushEvent(&event)) {
++    pending_functions_event_queued_ = false;
++  }
++}
++
++void SDLWindowedAppContext::PlatformQuitFromUIThread() {
++  quit_requested_ = true;
++  // Wake SDL_WaitEvent so the loop notices.
++  SDL_Event event;
++  SDL_zero(event);
++  event.type = SDL_EVENT_QUIT;
++  SDL_PushEvent(&event);
++}
++
++bool SDLWindowedAppContext::ShowSimpleMessageBox(const char* const title,
++                                                const char* const message) {
++  return SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, title, message, nullptr);
++}
++
++void SDLWindowedAppContext::RegisterWindow(uint32_t sdl_window_id, SDLWindow* window) {
++  windows_[sdl_window_id] = window;
++}
++
++void SDLWindowedAppContext::UnregisterWindow(uint32_t sdl_window_id) {
++  windows_.erase(sdl_window_id);
++  paint_queued_.erase(sdl_window_id);
++}
++
++void SDLWindowedAppContext::RequestPaint(uint32_t sdl_window_id) {
++  bool& queued = paint_queued_[sdl_window_id];
++  if (queued) {
++    return;
++  }
++  SDL_Event event;
++  SDL_zero(event);
++  event.type = paint_event_type_;
++  event.user.windowID = sdl_window_id;
++  if (SDL_PushEvent(&event)) {
++    queued = true;
++  }
++}
++
++void SDLWindowedAppContext::RunMainSDLLoop() {
++  if (HasQuitFromUIThread()) {
++    return;
++  }
++  SDL_Event event;
++  while (!quit_requested_) {
++    if (!SDL_WaitEvent(&event)) {
++      continue;
++    }
++    DispatchEvent(event);
++  }
++  // Something other than QuitFromUIThread may have ended the loop (an SDL_EVENT_QUIT from the OS,
++  // e.g. Cmd+Q on macOS): let the context know so pending functions stop being queued.
++  QuitFromUIThread();
++}
++
++void SDLWindowedAppContext::DispatchEvent(const SDL_Event& event) {
++  if (event.type == pending_functions_event_type_) {
++    // Re-arm before draining so a notification during execution is not lost.
++    pending_functions_event_queued_ = false;
++    ExecutePendingFunctionsFromUIThread();
++    return;
++  }
++  if (event.type == paint_event_type_) {
++    paint_queued_[event.user.windowID] = false;
++    auto it = windows_.find(event.user.windowID);
++    if (it != windows_.end()) {
++      it->second->HandlePaintEvent();
++    }
++    return;
++  }
++  if (event.type == SDL_EVENT_QUIT) {
++    // Application-level quit (Cmd+Q, or the iOS app being terminated): close every window, which
++    // lets the app shut the emulation down the same way as closing the window does.
++    if (!quit_requested_) {
++      for (auto it = windows_.begin(); it != windows_.end();) {
++        SDLWindow* window = it->second;
++        ++it;  // Closing may unregister the window.
++        window->HandleQuitRequest();
++      }
++    }
++    return;
++  }
++
++  // Window-targeted events carry the SDL window ID in the same position for every event struct
++  // that has one, but use the typed accessor per category to stay within SDL's documented API.
++  uint32_t window_id = 0;
++  if (event.type >= SDL_EVENT_WINDOW_FIRST && event.type <= SDL_EVENT_WINDOW_LAST) {
++    window_id = event.window.windowID;
++  } else {
++    switch (event.type) {
++      case SDL_EVENT_KEY_DOWN:
++      case SDL_EVENT_KEY_UP:
++        window_id = event.key.windowID;
++        break;
++      case SDL_EVENT_TEXT_INPUT:
++        window_id = event.text.windowID;
++        break;
++      case SDL_EVENT_MOUSE_MOTION:
++        window_id = event.motion.windowID;
++        break;
++      case SDL_EVENT_MOUSE_BUTTON_DOWN:
++      case SDL_EVENT_MOUSE_BUTTON_UP:
++        window_id = event.button.windowID;
++        break;
++      case SDL_EVENT_MOUSE_WHEEL:
++        window_id = event.wheel.windowID;
++        break;
++      case SDL_EVENT_DROP_FILE:
++        window_id = event.drop.windowID;
++        break;
++      case SDL_EVENT_FINGER_DOWN:
++      case SDL_EVENT_FINGER_UP:
++      case SDL_EVENT_FINGER_MOTION:
++      case SDL_EVENT_FINGER_CANCELED:
++        window_id = event.tfinger.windowID;
++        break;
++      default:
++        return;
++    }
++  }
++  auto it = windows_.find(window_id);
++  if (it == windows_.end()) {
++    // Touch events on iOS may arrive without a window ID; route them to the only window.
++    if (windows_.size() == 1 &&
++        (event.type == SDL_EVENT_FINGER_DOWN || event.type == SDL_EVENT_FINGER_UP ||
++         event.type == SDL_EVENT_FINGER_MOTION || event.type == SDL_EVENT_FINGER_CANCELED)) {
++      windows_.begin()->second->HandleEvent(event);
++    }
++    return;
++  }
++  it->second->HandleEvent(event);
++}
++
++}  // namespace ui
++}  // namespace rex
+diff --git a/src/ui/windowed_app_main_sdl.cpp b/src/ui/windowed_app_main_sdl.cpp
+new file mode 100644
+index 0000000..e4e8296
+--- /dev/null
++++ b/src/ui/windowed_app_main_sdl.cpp
+@@ -0,0 +1,101 @@
++/**
++ * ReXGlue entry point for Apple platforms (macOS / iOS), using SDL3 for the window and event loop.
++ *
++ * Mirrors windowed_app_main_posix.cpp. SDL_main.h turns main() into SDL's app entry, which on
++ * iOS runs UIApplicationMain and calls back into this function.
++ */
++
++#include <cstdio>
++#include <cstdlib>
++#include <filesystem>
++#include <map>
++#include <memory>
++#include <string>
++#include <utility>
++#include <vector>
++
++#include <spdlog/common.h>
++
++#include <rex/cvar.h>
++#include <rex/filesystem.h>
++#include <rex/logging.h>
++#include <rex/platform.h>
++#include <rex/ui/windowed_app.h>
++#include <rex/ui/windowed_app_context_sdl.h>
++
++#include <SDL3/SDL.h>
++#include <SDL3/SDL_main.h>
++
++namespace {
++
++// Where the log goes. macOS: beside the executable, as on Linux and Windows. iOS: the app bundle
++// is read-only, so the app's Documents folder (visible in the Files app when the Info.plist sets
++// UIFileSharingEnabled / LSSupportsOpeningDocumentsInPlace).
++std::filesystem::path GetLogFolder() {
++#if defined(TARGET_OS_IOS) && TARGET_OS_IOS
++  if (const char* documents = SDL_GetUserFolder(SDL_FOLDER_DOCUMENTS)) {
++    return std::filesystem::path(documents);
++  }
++#endif
++  return rex::filesystem::GetExecutableFolder();
++}
++
++}  // namespace
++
++int main(int argc, char** argv) {
++  auto init_result = rex::cvar::Init(argc, argv);
++  if (init_result.parse_error) {
++    std::fprintf(stderr,
++                 "WWE '13 could not start: invalid launch option: %s. Check your shortcut or "
++                 "launcher settings.\n",
++                 init_result.parse_error->c_str());
++    return EXIT_FAILURE;
++  }
++  if (init_result.exit_requested) {
++    return EXIT_SUCCESS;
++  }
++  auto remaining = std::move(init_result.remaining);
++  rex::cvar::ApplyEnvironment();
++
++  int result;
++
++  {
++    rex::ui::SDLWindowedAppContext app_context;
++    if (!app_context.Initialize()) {
++      return EXIT_FAILURE;
++    }
++
++    std::unique_ptr<rex::ui::WindowedApp> app = rex::ui::GetWindowedAppCreator()(app_context);
++
++    const auto& option_names = app->GetPositionalOptions();
++    std::map<std::string, std::string> parsed;
++    size_t count = std::min(remaining.size(), option_names.size());
++    for (size_t i = 0; i < count; ++i) {
++      parsed[option_names[i]] = remaining[i];
++    }
++    app->SetParsedArguments(std::move(parsed));
++
++    std::filesystem::path log_path = GetLogFolder() / (app->GetName() + ".log");
++
++    try {
++      rex::InitLogging(log_path.string().c_str());
++    } catch (const spdlog::spdlog_ex& e) {
++      std::fprintf(stderr, "Logging init failed for '%s': %s\n", log_path.string().c_str(),
++                   e.what());
++      rex::InitLogging(nullptr);
++    }
++
++    if (app->OnInitialize()) {
++      app_context.RunMainSDLLoop();
++      result = EXIT_SUCCESS;
++    } else {
++      result = EXIT_FAILURE;
++    }
++
++    app->InvokeOnDestroy();
++  }
++
++  rex::ShutdownLogging();
++
++  return result;
++}
+diff --git a/thirdparty/CMakeLists.txt b/thirdparty/CMakeLists.txt
+index 4fff893..282c16a 100644
+--- a/thirdparty/CMakeLists.txt
++++ b/thirdparty/CMakeLists.txt
+@@ -8,7 +8,7 @@ set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+ if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64)$")
+     set(IS_ARM64 FALSE)
+     set(IS_X86_64 TRUE)
+-elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|ARM64)$")
++elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|ARM64|arm64)$" OR CMAKE_OSX_ARCHITECTURES STREQUAL "arm64")
+     set(IS_ARM64 TRUE)
+     set(IS_X86_64 FALSE)
+ else()
+@@ -272,6 +272,19 @@ set(SDL_DISKAUDIO ON CACHE BOOL "" FORCE)
+ set(SDL_DUMMYAUDIO OFF CACHE BOOL "" FORCE)
+ set(SDL_DUMMYVIDEO OFF CACHE BOOL "" FORCE)
+ 
++# Apple (macOS / iOS): SDL3 also provides the window, the CAMetalLayer that MoltenVK presents to,
++# touch and game controller haptics/motion. Video, Metal, haptic and sensor are enabled there;
++# the renderer and the GL/Vulkan loaders stay off (presentation goes through ReXGlue's Vulkan).
++if(APPLE)
++    set(SDL_UNIX_CONSOLE_BUILD OFF CACHE BOOL "" FORCE)
++    set(SDL_VIDEO ON CACHE BOOL "" FORCE)
++    set(SDL_METAL ON CACHE BOOL "" FORCE)
++    set(SDL_HAPTIC ON CACHE BOOL "" FORCE)
++    set(SDL_SENSOR ON CACHE BOOL "" FORCE)
++    set(SDL_POWER ON CACHE BOOL "" FORCE)
++    set(SDL_FILESYSTEM ON CACHE BOOL "" FORCE)
++endif()
++
+ add_subdirectory(sdl3)
+ 
+ #=============================================================================
+-- 
+2.43.0
+

@@ -81,6 +81,43 @@ These parts work on Linux ARM64 but need Apple-specific code:
 7. **Game project.** `src/wwe13_app.h` uses GTK for error dialogs, and `release_diagnostics.cpp` and
    `single_instance.cpp` have Linux/Windows-only paths.
 
+## Step 2 – macOS (in progress)
+
+Code for the Apple platform, written without a Mac and checked by the **macOS port build check**
+workflow (`.github/workflows/macos-port.yml`, macOS arm64 runner, Xcode's compiler, native unit
+and PowerPC tests). It is in the ReXGlue patch series after 0103.
+
+| Area | Change |
+| --- | --- |
+| Build | Apple platform (`macos-arm64` / `ios-arm64`), AppleClang 16+ accepted, no `-mcmodel`, `-force_load` instead of `--whole-archive`, no `librt`, `arm64` processor name matched, `@loader_path` rpaths, `_XOPEN_SOURCE` + `_DARWIN_C_SOURCE` on ReXGlue code only |
+| Window | New SDL3 backend (`window_sdl`, `windowed_app_context_sdl`, `windowed_app_main_sdl`): Retina-aware sizes, keyboard, text input, mouse, wheel, touch, file drop, fullscreen, cursor auto-hide; also used for iOS later |
+| Graphics | `MetalLayerSurface` + `VK_EXT_metal_surface`, so MoltenVK presents to the SDL window's `CAMetalLayer` (portability enumeration was already there) |
+| SDL3 | Video, Metal, haptic and sensor turned on for Apple builds only |
+| Signals | Darwin `mcontext` (`__ss` / `__ns` / `__es.__esr`) read and written back; **SIGBUS handled like SIGSEGV** (Darwin raises SIGBUS for protection faults, which MMIO and write-watch use) |
+| Threads | Mach semaphores (Darwin has no `sem_init`), `SIGUSR1`/`SIGUSR2` instead of real-time signals, `pthread_threadid_np`, Darwin thread names, no affinity, no `SCHED_FIFO` |
+| Memory | `mach_vm_region` instead of `/proc/self/maps`, `MAP_FIXED_NOREPLACE` emulated (a commit never wipes committed memory), short `shm_open` names (Darwin limit 31), no `*64` functions |
+| Other | `_NSGetExecutablePath` for the executable folder, fibers on Darwin `ucontext`, freeze logger without `/proc` (no host backtraces on Apple yet) |
+| Game | macOS preset and `tools/setup-macos.sh` / `tools/build-macos.sh`; native alert instead of GTK; diagnostics read CPU, OS and RAM through `sysctl`; Darwin crash-handler PC and thread names |
+
+### Building on the Mac
+
+```bash
+brew install cmake ninja molten-vk vulkan-loader   # plus Xcode 16 or newer
+./tools/setup-macos.sh      # fetch + patch + build the SDK (Xcode clang, arm64)
+mkdir -p game && cp /path/to/your/WWE13/default.xex game/
+./tools/codegen.sh          # recompile your default.xex
+./tools/build-macos.sh
+```
+
+### Known gaps
+
+- Not yet built on a Mac: expect a first round of compile fixes from the CI job.
+- Freeze reports on Apple have no host backtraces, per-thread CPU time or thread state.
+- The launcher (Windows/Linux) is not ported; on macOS the game is started from Terminal for now.
+- iOS: `shm_open` is not allowed in the app sandbox, so guest memory needs Mach memory entries
+  (`mach_make_memory_entry_64` + `vm_map`), and the ~8 GB layout needs the extended virtual
+  addressing entitlement.
+
 ## Planned next steps
 
 - **Step 2 – macOS (Apple Silicon):** add the Apple platform to the SDK build, port items 2–4 for Darwin, and

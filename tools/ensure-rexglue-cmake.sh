@@ -11,14 +11,18 @@ set -euo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 SDK="$ROOT/../tools/rexglue"
-REXGLUE_BIN="$SDK/out/linux-amd64/RelWithDebInfo/rexglue"
+if [ "$(uname -s)" = "Darwin" ]; then
+  REXGLUE_BIN="$SDK/out/macos-arm64/RelWithDebInfo/rexglue"  # tools/setup-macos.sh
+else
+  REXGLUE_BIN="$SDK/out/linux-amd64/RelWithDebInfo/rexglue"
+fi
 
 if [ -f "$ROOT/generated/rexglue.cmake" ]; then
   exit 0
 fi
 
 test -x "$REXGLUE_BIN" || {
-  echo "Missing ReXGlue binary: $REXGLUE_BIN (run ./tools/setup.sh first)." >&2
+  echo "Missing ReXGlue binary: $REXGLUE_BIN (run ./tools/setup.sh, or ./tools/setup-macos.sh on a Mac, first)." >&2
   exit 1
 }
 

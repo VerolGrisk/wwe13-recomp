@@ -25,11 +25,27 @@
         "CMAKE_WIN32_EXECUTABLE": "ON",
         "CMAKE_CXX_STANDARD": "23"
       }
+    },
+    {
+      "name": "macos-arm64-relwithdebinfo",
+      "displayName": "macOS (Apple silicon)",
+      "generator": "Ninja Multi-Config",
+      "binaryDir": "${sourceDir}/out/build/macos-arm64-relwithdebinfo",
+      "cacheVariables": {
+        "CMAKE_C_COMPILER": "clang",
+        "CMAKE_CXX_COMPILER": "clang++",
+        "CMAKE_OSX_ARCHITECTURES": "arm64",
+        "CMAKE_OSX_DEPLOYMENT_TARGET": "14.0",
+        "CMAKE_PREFIX_PATH": "${sourceDir}/../tools/rexglue/out/install/macos-arm64",
+        "CMAKE_CXX_STANDARD": "23"
+      },
+      "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Darwin" }
     }
   ],
   "buildPresets": [
     { "name": "linux-amd64-relwithdebinfo", "configurePreset": "linux-amd64-relwithdebinfo", "configuration": "RelWithDebInfo" },
-    { "name": "win-amd64-cross", "configurePreset": "win-amd64-cross", "configuration": "RelWithDebInfo" }
+    { "name": "win-amd64-cross", "configurePreset": "win-amd64-cross", "configuration": "RelWithDebInfo" },
+    { "name": "macos-arm64-relwithdebinfo", "configurePreset": "macos-arm64-relwithdebinfo", "configuration": "RelWithDebInfo" }
   ],
   "testPresets": []
 }
