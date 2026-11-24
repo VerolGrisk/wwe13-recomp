@@ -5,8 +5,14 @@
 #include <cstdio>
 #include <map>
 #include <string>
+#include <vector>
 
 #include <volk.h>
+
+#if defined(__APPLE__)
+#include <dlfcn.h>
+#include <cstring>
+#endif
 
 namespace wwe13::launcher {
 namespace {
@@ -24,11 +30,55 @@ std::string Lower(std::string value) {
   return value;
 }
 
+#if defined(__APPLE__)
+// volkInitialize() only dlopens bare names, which do not search Homebrew's prefix or an app
+// bundle. Try the places the game also looks (rex/platform/dynlib.h kVulkanLoaderFallbacks).
+bool InitializeVulkanLoader() {
+  if (volkInitialize() == VK_SUCCESS) return true;
+  static const char* const kCandidates[] = {
+      "@executable_path/libvulkan.1.dylib",
+      "@executable_path/../Frameworks/libvulkan.1.dylib",
+      "/opt/homebrew/lib/libvulkan.1.dylib",
+      "/usr/local/lib/libvulkan.1.dylib",
+  };
+  for (const char* candidate : kCandidates) {
+    void* library = dlopen(candidate, RTLD_NOW | RTLD_LOCAL);
+    if (!library) continue;
+    auto get_instance_proc_addr =
+        reinterpret_cast<PFN_vkGetInstanceProcAddr>(dlsym(library, "vkGetInstanceProcAddr"));
+    if (get_instance_proc_addr) {
+      // Kept loaded for the process lifetime, like the loader volk opens itself.
+      volkInitializeCustom(get_instance_proc_addr);
+      return true;
+    }
+    dlclose(library);
+  }
+  return false;
+}
+
+// MoltenVK is a portability driver: the loader only lists it when the instance enables
+// VK_KHR_portability_enumeration and sets the matching flag.
+bool HasInstanceExtension(const char* name) {
+  uint32_t count = 0;
+  if (vkEnumerateInstanceExtensionProperties(nullptr, &count, nullptr) != VK_SUCCESS) return false;
+  std::vector<VkExtensionProperties> extensions(count);
+  if (vkEnumerateInstanceExtensionProperties(nullptr, &count, extensions.data()) != VK_SUCCESS) {
+    return false;
+  }
+  for (const VkExtensionProperties& extension : extensions) {
+    if (std::strcmp(extension.extensionName, name) == 0) return true;
+  }
+  return false;
+}
+#else
+bool InitializeVulkanLoader() { return volkInitialize() == VK_SUCCESS; }
+#endif
+
 }  // namespace
 
 std::vector<GpuInfo> ListGpus() {
   std::vector<GpuInfo> result;
-  if (volkInitialize() != VK_SUCCESS) return result;
+  if (!InitializeVulkanLoader()) return result;
 
   VkApplicationInfo application{};
   application.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
@@ -40,6 +90,14 @@ std::vector<GpuInfo> ListGpus() {
   VkInstanceCreateInfo create_info{};
   create_info.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
   create_info.pApplicationInfo = &application;
+#if defined(__APPLE__)
+  const char* const portability_extension = VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME;
+  if (HasInstanceExtension(portability_extension)) {
+    create_info.flags |= VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
+    create_info.enabledExtensionCount = 1;
+    create_info.ppEnabledExtensionNames = &portability_extension;
+  }
+#endif
 
   VkInstance instance = VK_NULL_HANDLE;
   if (vkCreateInstance(&create_info, nullptr, &instance) != VK_SUCCESS || instance == VK_NULL_HANDLE) {

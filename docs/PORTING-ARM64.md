@@ -191,23 +191,33 @@ jump, not an extra call). A strong hand-written `X` still replaces it at link ti
 
 ### Launcher
 
-The launcher (`launcher2/`, SDL3 + Dear ImGui) builds and opens on macOS with the steps in
-`docs/BUILDING.md`, using Xcode's compilers:
+The launcher (`launcher2/`, SDL3 + Dear ImGui) is built by `tools/build-macos.sh` together with the
+game. The script puts both, with the game's FFmpeg libraries, in `out/macos-arm64/`, the same layout
+as the Linux release folder:
 
 ```bash
-cmake -S launcher2 -B out/launcher2 -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo \
-  -DCMAKE_C_COMPILER="$(xcrun --find clang)" -DCMAKE_CXX_COMPILER="$(xcrun --find clang++)"
-cmake --build out/launcher2
-out/launcher2/wwe13-launcher
+./tools/build-macos.sh
+out/macos-arm64/wwe13-launcher
 ```
 
-The one fix: `core/internal/miniz_impl.c` defined `_LARGEFILE64_SOURCE` on every platform, which
-made miniz call glibc's `fopen64`/`stat64`, which Darwin does not have. It is now skipped on Apple, where
-the plain functions are already 64-bit. The launcher finds its own folder through
-`SDL_GetBasePath` (there is no `/proc/self/exe`) and starts the game with `posix_spawn`, as on Linux:
-**Play** runs a `wwe13` executable next to the launcher. That path is untested on macOS, because
-it needs a game build, and `tools/build-macos.sh` writes the game to
-`out/build/macos-arm64-relwithdebinfo/RelWithDebInfo/`, so for now copy it next to the launcher.
+**Play** starts `./wwe13` from the launcher's folder with `posix_spawn`, as on Linux; settings,
+`userdata` and `logs` live there too. Put the game folder at `out/macos-arm64/WWE 13`, or pick it on
+the Game files page. Rebuilding replaces only the launcher, the game and the two libraries.
+
+Mac fixes:
+
+- `core/internal/miniz_impl.c` defined `_LARGEFILE64_SOURCE` on every platform, which made miniz call
+  glibc's `fopen64`/`stat64`; Darwin does not have them. Skipped on Apple, where the plain functions
+  are already 64-bit.
+- `core/gpus.cpp` found no GPU, so the Play page said "THIS PC CAN'T RUN IT" and refused to start:
+  volk only dlopens bare names (not Homebrew's `/opt/homebrew/lib` or an app bundle), and MoltenVK is
+  a portability driver that is only listed when the instance enables
+  `VK_KHR_portability_enumeration`. On Apple the launcher now also tries the game's loader paths and
+  enables portability enumeration; it lists the Apple GPU with the same ID the game uses.
+
+Checked by running the launcher's own `BuildLaunchPlan` + `StartGame` (what Play calls): the game
+started from `out/macos-arm64/` with the chosen game folder and was still running after the
+20-second early-exit watch.
 
 ### First game boot (patches 0109–0115)
 
@@ -252,8 +262,8 @@ Not problems, though they look like them in the log:
 ### Known gaps
 
 - Freeze reports on Apple have no host backtraces, per-thread CPU time or thread state.
-- The launcher is not part of the macOS build scripts or CI yet, there is no `.app` bundle, and
-  starting the game from it is untested (see above).
+- No `.app` bundle yet (the launcher is started from Terminal or Finder as a plain executable), and
+  the launcher is not built in CI.
 - iOS: `shm_open` is not allowed in the app sandbox, so guest memory needs Mach memory entries
   (`mach_make_memory_entry_64` + `vm_map`), and the ~8 GB layout needs the extended virtual
   addressing entitlement.
