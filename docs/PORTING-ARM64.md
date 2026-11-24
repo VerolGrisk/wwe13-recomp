@@ -188,10 +188,31 @@ build on Apple too. With 0108, codegen emits `PPC_FUNC_ALIAS(X)`: the same alias
 Linux and Windows, and on Apple a weak `X` that tail-calls `__imp__X` (`[[clang::musttail]]`, so a
 jump, not an extra call). A strong hand-written `X` still replaces it at link time.
 
+### Launcher
+
+The launcher (`launcher2/`, SDL3 + Dear ImGui) builds and opens on macOS with the steps in
+`docs/BUILDING.md`, using Xcode's compilers:
+
+```bash
+cmake -S launcher2 -B out/launcher2 -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+  -DCMAKE_C_COMPILER="$(xcrun --find clang)" -DCMAKE_CXX_COMPILER="$(xcrun --find clang++)"
+cmake --build out/launcher2
+out/launcher2/wwe13-launcher
+```
+
+The one fix: `core/internal/miniz_impl.c` defined `_LARGEFILE64_SOURCE` on every platform, which
+made miniz call glibc's `fopen64`/`stat64`, which Darwin does not have. It is now skipped on Apple, where
+the plain functions are already 64-bit. The launcher finds its own folder through
+`SDL_GetBasePath` (there is no `/proc/self/exe`) and starts the game with `posix_spawn`, as on Linux:
+**Play** runs a `wwe13` executable next to the launcher. That path is untested on macOS, because
+it needs a game build, and `tools/build-macos.sh` writes the game to
+`out/build/macos-arm64-relwithdebinfo/RelWithDebInfo/`, so for now copy it next to the launcher.
+
 ### Known gaps
 
 - Freeze reports on Apple have no host backtraces, per-thread CPU time or thread state.
-- The launcher (Windows/Linux) is not ported; on macOS the game is started from Terminal for now.
+- The launcher is not part of the macOS build scripts or CI yet, there is no `.app` bundle, and
+  starting the game from it is untested (see above).
 - iOS: `shm_open` is not allowed in the app sandbox, so guest memory needs Mach memory entries
   (`mach_make_memory_entry_64` + `vm_map`), and the ~8 GB layout needs the extended virtual
   addressing entitlement.
