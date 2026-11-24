@@ -1,0 +1,77 @@
+From 374eafc3565b90c05900f388ca7aad595437074b Mon Sep 17 00:00:00 2001
+From: WWE13 Recomp <wwe13-recomp@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 19:52:38 -0500
+Subject: [PATCH] codegen: PPC_FUNC_ALIAS, with a tail-call wrapper on Apple
+ (no Mach-O aliases)
+
+Every recompiled function was emitted as
+  __attribute__((alias("__imp__X"))) PPC_WEAK_FUNC(X);
+  PPC_FUNC_IMPL(__imp__X) { ... }
+so that a hand-written strong PPC_FUNC(X) can replace the recompiled
+code while __imp__X stays callable. Mach-O has no symbol aliases, so
+clang rejects this on Darwin ("aliases are not supported on darwin"),
+which broke ppc_tests and would break every game build on Apple.
+
+Codegen now emits PPC_FUNC_ALIAS(X). On non-Apple platforms it expands
+to the same alias declaration as before. On Apple it declares __imp__X
+and defines a weak X that tail-calls it ([[clang::musttail]], so a jump
+rather than a call); a strong PPC_FUNC(X) still wins at link time.
+
+ppc_tests on macOS arm64 (with binutils 2.24 + VMX128): 1464 / 1464 pass.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ include/rex/ppc/context.h      | 14 ++++++++++++++
+ src/codegen/function_graph.cpp |  4 ++--
+ 2 files changed, 16 insertions(+), 2 deletions(-)
+
+diff --git a/include/rex/ppc/context.h b/include/rex/ppc/context.h
+index b1d88d9..0f6455e 100644
+--- a/include/rex/ppc/context.h
++++ b/include/rex/ppc/context.h
+@@ -88,6 +88,20 @@ uint64_t PPCMissingIndirectFunctionCallCount() noexcept;
+ #define PPC_EXTERN_IMPORT(x) extern "C" PPC_FUNC(x)  // For __imp__ kernel imports
+ #define PPC_WEAK_FUNC(x) __attribute__((weak, noinline)) PPC_FUNC(x)
+ 
++// Declares the overridable entry point x for the recompiled function __imp__x (defined next with
++// PPC_FUNC_IMPL): a weak x that a strong hand-written PPC_FUNC(x) replaces at link time.
++// Mach-O has no symbol aliases, so on Apple x is a weak function that tail-calls __imp__x.
++#if defined(__APPLE__)
++#define PPC_FUNC_ALIAS(x)        \
++  PPC_EXTERN_FUNC(__imp__##x);   \
++  PPC_WEAK_FUNC(x) {             \
++    [[clang::musttail]] return __imp__##x(ctx, base); \
++  }                              \
++  static_assert(true, "")
++#else
++#define PPC_FUNC_ALIAS(x) __attribute__((alias(PPC_STRINGIFY(PPC_JOIN(__imp__, x))))) PPC_WEAK_FUNC(x)
++#endif
++
+ // Compiler-specific assume hint for alignment, with optional Tracy zone
+ #if defined(REXGLUE_PROFILE_GUEST_FUNCTIONS) && defined(REXGLUE_ENABLE_PROFILING)
+ #include <tracy/Tracy.hpp>
+diff --git a/src/codegen/function_graph.cpp b/src/codegen/function_graph.cpp
+index ac5dcdd..f86c82d 100644
+--- a/src/codegen/function_graph.cpp
++++ b/src/codegen/function_graph.cpp
+@@ -367,7 +367,7 @@ std::string FunctionNode::emitCpp(const EmitContext& ctx) const {
+     }
+ 
+     emit_println(out, "// STUB: Function at 0x{:08X} has no discovered code blocks", base());
+-    emit_println(out, "__attribute__((alias(\"__imp__{}\"))) PPC_WEAK_FUNC({});", name, name);
++    emit_println(out, "PPC_FUNC_ALIAS({});", name);
+     emit_println(out, "PPC_FUNC_IMPL(__imp__{}) {{", name);
+     emit_println(out, "\tPPC_FUNC_PROLOGUE();");
+     emit_println(out, "}}\n");
+@@ -480,7 +480,7 @@ std::string FunctionNode::emitCpp(const EmitContext& ctx) const {
+   }
+ 
+   // Function signature with weak/alias pattern
+-  emit_println(out, "__attribute__((alias(\"__imp__{}\"))) PPC_WEAK_FUNC({});", name, name);
++  emit_println(out, "PPC_FUNC_ALIAS({});", name);
+   emit_println(out, "PPC_FUNC_IMPL(__imp__{}) {{", name);
+   emit_println(out, "\tPPC_FUNC_PROLOGUE();");
+ 
+-- 
+2.54.0 (Apple Git-157)
+

@@ -23,8 +23,6 @@ jobs:
   sdk:
     runs-on: macos-15
     timeout-minutes: 150
-    env:
-      BINUTILS_VERSION: "2.42"
     steps:
       - uses: actions/checkout@v4
 
@@ -35,26 +33,18 @@ jobs:
           xcrun clang++ --version
           cmake --version
 
-      # powerpc-none-elf as/ld/nm for the instruction tests (the SDK only ships Linux/Windows builds).
+      # powerpc-none-elf as/ld/nm with Xbox 360 VMX128 (-mvmx128) for the instruction tests: the SDK
+      # only ships Linux/Windows builds, and upstream binutils has no VMX128.
       - name: Cache PowerPC binutils
         id: binutils-cache
         uses: actions/cache@v4
         with:
           path: ${{ runner.temp }}/ppc-binutils
-          key: ppc-binutils-${{ env.BINUTILS_VERSION }}-macos-arm64
+          key: ppc-binutils-vmx128-${{ hashFiles('tools/build-ppc-binutils-macos.sh', 'tools/ppc-binutils/*.patch') }}-macos-arm64
 
-      - name: Build PowerPC binutils
+      - name: Build PowerPC binutils (2.24 + VMX128)
         if: steps.binutils-cache.outputs.cache-hit != 'true'
-        run: |
-          cd "$RUNNER_TEMP"
-          curl -fsSLO "https://ftpmirror.gnu.org/binutils/binutils-${BINUTILS_VERSION}.tar.xz"
-          tar xf "binutils-${BINUTILS_VERSION}.tar.xz"
-          mkdir binutils-build && cd binutils-build
-          "../binutils-${BINUTILS_VERSION}/configure" --target=powerpc-none-elf \
-            --prefix="$RUNNER_TEMP/ppc-binutils" --disable-nls --disable-werror \
-            --disable-gdb --disable-gprof --disable-sim --without-zstd
-          make -j"$(sysctl -n hw.ncpu)" all-gas all-ld all-binutils
-          make install-gas install-ld install-binutils
+        run: ./tools/build-ppc-binutils-macos.sh "$RUNNER_TEMP/ppc-binutils"
 
       - name: Fetch, patch and build ReXGlue with tests
         env:

@@ -15,7 +15,8 @@
 #   REXGLUE_URL       fork URL override
 #   REXGLUE_TESTS=1   also build the unit tests, the PowerPC instruction tests and rex_smoke (the
 #                     window/MoltenVK/guest-memory smoke test); the instruction tests need a
-#                     powerpc-none-elf binutils (as, ld, nm), found through PPC_BINUTILS_DIR
+#                     powerpc-none-elf binutils with VMX128 (as, ld, nm), found through
+#                     PPC_BINUTILS_DIR (build it with tools/build-ppc-binutils-macos.sh)
 #   PPC_BINUTILS_DIR  folder holding powerpc-none-elf-{as,ld,nm} (only with REXGLUE_TESTS=1)
 #   CONFIG            build configuration (default RelWithDebInfo)
 set -euo pipefail
@@ -68,7 +69,8 @@ if [ "$REXGLUE_TESTS" = "1" ]; then
       ln -sf "$PPC_BINUTILS_DIR/powerpc-none-elf-$tool" "$SDK/tools/binutils/powerpc-none-elf-$tool"
     done
   else
-    echo "REXGLUE_TESTS=1 needs PPC_BINUTILS_DIR (powerpc-none-elf binutils built for macOS)" >&2
+    echo "REXGLUE_TESTS=1 needs PPC_BINUTILS_DIR (powerpc-none-elf binutils with VMX128;" \
+      "build them with tools/build-ppc-binutils-macos.sh)" >&2
     exit 1
   fi
 fi

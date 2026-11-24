@@ -86,7 +86,7 @@ These parts work on Linux ARM64 but need Apple-specific code:
 Code for the Apple platform, written without a Mac and checked by the **macOS port build check**
 workflow (`.github/workflows/macos-port.yml`, macOS arm64 runner, Xcode's compiler, native unit
 and PowerPC tests). It is in the ReXGlue patch series after 0103 (0104, 0105, 0106 with the
-fixes from the first native build, and 0107 for 16 KB host pages).
+fixes from the first native build, 0107 for 16 KB host pages, and 0108 for function aliases).
 
 | Area | Change |
 | --- | --- |
@@ -119,7 +119,8 @@ shows window size, DPI, fullscreen state, frame rate and recent input events.
 
 ```bash
 brew install molten-vk vulkan-loader
-REXGLUE_TESTS=1 PPC_BINUTILS_DIR=/path/to/ppc-binutils/bin ./tools/setup-macos.sh
+./tools/build-ppc-binutils-macos.sh      # PowerPC as/ld/nm with VMX128, into ../tools/ppc-binutils-vmx128
+REXGLUE_TESTS=1 PPC_BINUTILS_DIR=$PWD/../tools/ppc-binutils-vmx128/bin ./tools/setup-macos.sh
 ../tools/rexglue/out/build/macos-arm64/tests/bin/RelWithDebInfo/rex_smoke              # interactive
 ../tools/rexglue/out/build/macos-arm64/tests/bin/RelWithDebInfo/rex_smoke --smoke_seconds=10  # prints PASS/FAIL
 ```
@@ -149,7 +150,7 @@ Results on the Mac:
 | --- | --- |
 | `rex_smoke --smoke_seconds=10` | **PASS**: SDL3 window, MoltenVK on the Apple GPU, Retina 2560x1440 at about 300 fps; guest memory reserved at `0x8000000000`, MMIO read and write traps fire (SIGBUS path) |
 | `unit_tests` | 191 cases: 186 pass, 5 skipped, 0 fail (with 0107; before it, 6 to 10 failed in guest memory) |
-| `ppc_tests` | Does not build (see the PowerPC assembler below) |
+| `ppc_tests` | **1464 test cases, all pass** natively (with 0108 and the VMX128 assembler below) |
 
 ### 16 KB host pages (patch 0107)
 
@@ -170,14 +171,25 @@ accessible committed page does not fault on the host. That only matters for a ga
 4 KB guard page next to live data. The unit tests check protection bookkeeping and the recovery
 callback, not real hardware faults on such pages, so watch for this when booting the game.
 
+### PowerPC test assembler and function aliases (patch 0108)
+
+The instruction tests assemble with `-mvmx128` (Xbox 360 VMX128), which upstream binutils does
+not have. The SDK's bundled assembler is GNU binutils 2.24 with Xenia's VMX128 patch, but only for
+x86-64 Linux and Windows. `tools/build-ppc-binutils-macos.sh` builds the same thing natively for
+macOS: binutils 2.24 (checksum-verified) plus Xenia's patch, kept in
+`tools/ppc-binutils/binutils-2.24-vmx128.patch`. Binutils 2.24 predates Apple silicon and Xcode's
+current C defaults, so the script gives the build triple explicitly and compiles as gnu89 with those
+errors relaxed. The macOS CI job uses the same script.
+
+With that assembler, the tests then failed to compile with "aliases are not supported on darwin".
+Codegen emitted every recompiled function as a weak alias `X` of `__imp__X`, so that a hand-written
+`PPC_FUNC(X)` can replace it, and Mach-O has no symbol aliases. That would have broken every game
+build on Apple too. With 0108, codegen emits `PPC_FUNC_ALIAS(X)`: the same alias as before on
+Linux and Windows, and on Apple a weak `X` that tail-calls `__imp__X` (`[[clang::musttail]]`, so a
+jump, not an extra call). A strong hand-written `X` still replaces it at link time.
+
 ### Known gaps
 
-- **PowerPC test assembler.** The instruction tests need `powerpc-none-elf-as` with the Xbox 360
-  `-mvmx128` extension. The SDK's bundled build has it, but only for x86-64 Linux and Windows. Stock
-  GNU binutils 2.42, which `PPC_BINUTILS_DIR` above and the CI job build, rejects `-mvmx128`, so
-  `ppc_tests` cannot be built on macOS yet, and the CI job's PowerPC test step will fail the same
-  way. Stock binutils 2.42 also needs `CFLAGS="-O2 -std=gnu17"` and `--with-system-zlib` with
-  Xcode 27's clang, because its bundled zlib is K&R C.
 - Freeze reports on Apple have no host backtraces, per-thread CPU time or thread state.
 - The launcher (Windows/Linux) is not ported; on macOS the game is started from Terminal for now.
 - iOS: `shm_open` is not allowed in the app sandbox, so guest memory needs Mach memory entries
