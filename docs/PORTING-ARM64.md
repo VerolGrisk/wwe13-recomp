@@ -87,7 +87,7 @@ Code for the Apple platform, written without a Mac and checked by the **macOS po
 workflow (`.github/workflows/macos-port.yml`, macOS arm64 runner, Xcode's compiler, native unit
 and PowerPC tests). It is in the ReXGlue patch series after 0103 (0104, 0105, 0106 with the
 fixes from the first native build, 0107 for 16 KB host pages, 0108 for function aliases, and
-0109–0114 from the first game boot).
+0109–0115 from the first game boot).
 
 | Area | Change |
 | --- | --- |
@@ -209,7 +209,7 @@ the plain functions are already 64-bit. The launcher finds its own folder throug
 it needs a game build, and `tools/build-macos.sh` writes the game to
 `out/build/macos-arm64-relwithdebinfo/RelWithDebInfo/`, so for now copy it next to the launcher.
 
-### First game boot (patches 0109–0114)
+### First game boot (patches 0109–0115)
 
 Codegen and the game build work on the Mac (72,827 functions; codegen takes about 40 s). The game
 boots to the attract-mode demo match and the menus, with sound and input. To get there:
@@ -220,7 +220,7 @@ boots to the attract-mode demo match and the menus, with sound and input. To get
 | Most game sources fail: `#include <version>` finds the repository's `VERSION` file (case-insensitive file system) | 0113: on Apple the project root is searched with `-iquote` only |
 | The game cannot load FFmpeg: the dylibs were copied under their full version names, not the `@rpath` install names | 0113: copy under the install names, as on Linux |
 | Crash handler: Darwin's PC is an integer, and `pthread_setname_np` takes only a name | `src/release_diagnostics.cpp` |
-| Vulkan device rejected: Apple GPUs have no geometry shaders | run with `--vulkan_require_geometry_shader=false` (the SDK's fallback paths) |
+| Vulkan device rejected: Apple GPUs have no geometry shaders | 0115: `vulkan_require_geometry_shader` defaults to false on Apple (the SDK's fallback paths) |
 | **Black screen: startup deadlock** on a critical section with a lock count but no owner | 0110: recompiled code did not add the 0x1000 host offset for the 0xE0000000 heap on Apple silicon, so guest code and the kernel saw that heap 4 KB apart. Now on for Apple arm64, with a startup check that both sides agree |
 | Purple screen: the rectangle-list fallback vertex shader was invalid SPIR-V and used a `gl_PerVertex` local that SPIRV-Cross cannot declare in MSL | 0111. All 13 shaders seen convert and compile with the Metal compiler |
 | A failed pipeline was recompiled and logged on every draw | 0112: failed pipelines are remembered; `--dump_shaders` now works for Vulkan |
@@ -228,8 +228,8 @@ boots to the attract-mode demo match and the menus, with sound and input. To get
 Running it (from the build folder; the launcher passes the same options):
 
 ```bash
-./wwe13 "/path/to/WWE 13" --vulkan_require_geometry_shader=false --fullscreen=false \
-  --ignore_offset_for_ranged_allocations=true --mnk_mode=true --user_data_root=$PWD/userdata
+./wwe13 "/path/to/WWE 13" --fullscreen=false --ignore_offset_for_ranged_allocations=true \
+  --mnk_mode=true --user_data_root=$PWD/userdata
 ```
 
 **Window froze on the loading screen (0114).** The game kept running (demo match, crowd and

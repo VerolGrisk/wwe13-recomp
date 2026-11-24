@@ -1,0 +1,48 @@
+From e03164f30e64033aeabd385df040e10f3ab4196b Mon Sep 17 00:00:00 2001
+From: WWE13 Recomp <wwe13-recomp@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 07:03:35 -0500
+Subject: [PATCH] vulkan: vulkan_require_geometry_shader defaults to false on
+ Apple
+
+Metal has no geometry shaders, so MoltenVK never exposes geometryShader
+and the default (true) made Vulkan initialization fail on every Mac
+("no usable graphics device") unless the user passed
+--vulkan_require_geometry_shader=false. On Apple the fallback primitive
+paths (rectangle lists and point sprites expanded in the vertex shader,
+fixed for MoltenVK in 0111) are the only way to run, so they are now the
+default there. Other platforms keep requiring geometry shaders.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/ui/vulkan/vulkan_device.cpp | 14 ++++++++++++--
+ 1 file changed, 12 insertions(+), 2 deletions(-)
+
+diff --git a/src/ui/vulkan/vulkan_device.cpp b/src/ui/vulkan/vulkan_device.cpp
+index 339df65..e1a48e4 100644
+--- a/src/ui/vulkan/vulkan_device.cpp
++++ b/src/ui/vulkan/vulkan_device.cpp
+@@ -33,9 +33,19 @@ REXCVAR_DEFINE_BOOL(vulkan_require_vertex_pipeline_stores_and_atomics, true, "UI
+                     "Deprecated and ignored for parity; vertexPipelineStoresAndAtomics is always "
+                     "required for Vulkan GPU emulation")
+     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+-REXCVAR_DEFINE_BOOL(vulkan_require_geometry_shader, true, "UI/Vulkan",
++// Metal has no geometry shaders, so MoltenVK never exposes geometryShader: on Apple the fallback
++// primitive paths (rectangle lists and point sprites expanded in the vertex shader) are the only
++// way to run, and they are the default there.
++#if REX_PLATFORM_MAC
++#define REX_VULKAN_REQUIRE_GEOMETRY_SHADER_DEFAULT false
++#else
++#define REX_VULKAN_REQUIRE_GEOMETRY_SHADER_DEFAULT true
++#endif
++REXCVAR_DEFINE_BOOL(vulkan_require_geometry_shader, REX_VULKAN_REQUIRE_GEOMETRY_SHADER_DEFAULT,
++                    "UI/Vulkan",
+                     "Require geometryShader support for Vulkan GPU emulation (disable to allow "
+-                    "fallback primitive emulation paths)")
++                    "fallback primitive emulation paths; off by default on Apple, where Metal "
++                    "has no geometry shaders)")
+     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+ REXCVAR_DEFINE_BOOL(vulkan_require_fill_mode_non_solid, true, "UI/Vulkan",
+                     "Require fillModeNonSolid support for Vulkan GPU emulation (disable to "
+-- 
+2.54.0 (Apple Git-157)
+
