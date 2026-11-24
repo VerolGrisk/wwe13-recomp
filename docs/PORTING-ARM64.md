@@ -87,7 +87,7 @@ Code for the Apple platform, written without a Mac and checked by the **macOS po
 workflow (`.github/workflows/macos-port.yml`, macOS arm64 runner, Xcode's compiler, native unit
 and PowerPC tests). It is in the ReXGlue patch series after 0103 (0104, 0105, 0106 with the
 fixes from the first native build, 0107 for 16 KB host pages, 0108 for function aliases, and
-0109–0113 from the first game boot).
+0109–0114 from the first game boot).
 
 | Area | Change |
 | --- | --- |
@@ -209,10 +209,10 @@ the plain functions are already 64-bit. The launcher finds its own folder throug
 it needs a game build, and `tools/build-macos.sh` writes the game to
 `out/build/macos-arm64-relwithdebinfo/RelWithDebInfo/`, so for now copy it next to the launcher.
 
-### First game boot (patches 0109–0113)
+### First game boot (patches 0109–0114)
 
 Codegen and the game build work on the Mac (72,827 functions; codegen takes about 40 s). The game
-boots to its first loading screen with correct colours and plays music. To get there:
+boots to the attract-mode demo match and the menus, with sound and input. To get there:
 
 | Problem | Fix |
 | --- | --- |
@@ -232,11 +232,22 @@ Running it (from the build folder; the launcher passes the same options):
   --ignore_offset_for_ranged_allocations=true --mnk_mode=true --user_data_root=$PWD/userdata
 ```
 
-**Open: stuck on the first loading screen.** The screen animates (about 50 frames/s) and music plays,
-but loading never finishes. Wwise keeps retrying two sound banks, `Weapons_M` (2.1 MB) and `WSD`
-(5.8 MB), while `Weapons` (105 KB) from the same `Game.pck` loads. Ruled out so far: missing data (all
-banks are in the packages), file reads (synchronous, no errors), locks, GPU errors, and memory (the
-failed physical allocations are the game's normal probing, see patch 0038).
+**Window froze on the loading screen (0114).** The game kept running (demo match, crowd and
+commentary audio, menus, input) but the window stayed on the loading screen. The presenter requests
+paints from the guest-output thread, and the SDL backend's per-window "paint pending" flag was an
+unguarded map the UI thread clears on dispatch; a request racing a dispatch was dropped, and the
+presenter (which also dedups pending paints) never painted again. The flags are now guarded.
+
+With 0114 the game boots through the logo video and the loading screen to the attract-mode demo
+match ("Press START button"); Start leads to the save-data notice. Loading is slow: the demo match
+appears about 2 minutes after launch.
+
+Not problems, though they look like them in the log:
+
+- `NtCreateFile FAILED: GAME:\Sound\English(US)<bank>.bnk`, repeated: Wwise tries a language-specific
+  loose file first each time it reopens a bank to stream media, then finds the bank in the `sfx`
+  table of the `.pck` packages. Every bank loads.
+- Bursts of failed physical allocations: the game probing free memory, as on Linux (patch 0038).
 
 ### Known gaps
 

@@ -1,0 +1,102 @@
+From 468af218601499d6482eb524e1399e4cd1b1ea40 Mon Sep 17 00:00:00 2001
+From: WWE13 Recomp <wwe13-recomp@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 06:51:36 -0500
+Subject: [PATCH] ui/sdl: thread-safe paint requests (window froze while the
+ game ran)
+
+Presenter::RequestPaintOrConnectionRecoveryViaWindow is called from any
+thread, including the guest-output thread for every new frame, but
+SDLWindowedAppContext::RequestPaint kept its per-window "paint event
+pending" flag in an unguarded unordered_map that the UI thread clears on
+dispatch. A request racing a dispatch could be dropped with no paint
+event queued; the presenter, which also dedups pending paints, then
+never painted again. On macOS WWE '13 kept running (demo match, menus,
+input) while the window stayed on the loading screen.
+
+The flags are now guarded by a mutex: a request claims the pending event
+atomically (undone if SDL_PushEvent fails), and the UI thread clears it
+before painting, so a request made during a paint queues another one.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ include/rex/ui/windowed_app_context_sdl.h |  4 ++++
+ src/ui/windowed_app_context_sdl.cpp       | 25 +++++++++++++++++------
+ 2 files changed, 23 insertions(+), 6 deletions(-)
+
+diff --git a/include/rex/ui/windowed_app_context_sdl.h b/include/rex/ui/windowed_app_context_sdl.h
+index 292a957..b8a8805 100644
+--- a/include/rex/ui/windowed_app_context_sdl.h
++++ b/include/rex/ui/windowed_app_context_sdl.h
+@@ -9,6 +9,7 @@
+ 
+ #include <atomic>
+ #include <cstdint>
++#include <mutex>
+ #include <unordered_map>
+ 
+ #include <rex/ui/windowed_app_context.h>
+@@ -53,6 +54,9 @@ class SDLWindowedAppContext final : public WindowedAppContext {
+   std::atomic<bool> pending_functions_event_queued_{false};
+   bool quit_requested_ = false;
+   std::unordered_map<uint32_t, SDLWindow*> windows_;
++  // RequestPaint is called from any thread (the presenter's guest-output thread among them), so
++  // the per-window "paint event pending" flags are guarded.
++  std::mutex paint_queued_mutex_;
+   std::unordered_map<uint32_t, bool> paint_queued_;
+ };
+ 
+diff --git a/src/ui/windowed_app_context_sdl.cpp b/src/ui/windowed_app_context_sdl.cpp
+index e392259..1b4ef0a 100644
+--- a/src/ui/windowed_app_context_sdl.cpp
++++ b/src/ui/windowed_app_context_sdl.cpp
+@@ -77,20 +77,29 @@ void SDLWindowedAppContext::RegisterWindow(uint32_t sdl_window_id, SDLWindow* wi
+ 
+ void SDLWindowedAppContext::UnregisterWindow(uint32_t sdl_window_id) {
+   windows_.erase(sdl_window_id);
++  std::lock_guard<std::mutex> lock(paint_queued_mutex_);
+   paint_queued_.erase(sdl_window_id);
+ }
+ 
+ void SDLWindowedAppContext::RequestPaint(uint32_t sdl_window_id) {
+-  bool& queued = paint_queued_[sdl_window_id];
+-  if (queued) {
+-    return;
++  // Any thread. Claim the single pending paint event for the window atomically; a request that
++  // loses the race to a paint being dispatched would otherwise be dropped with nothing queued,
++  // and the presenter (which also dedups pending paints) would then never paint again.
++  {
++    std::lock_guard<std::mutex> lock(paint_queued_mutex_);
++    bool& queued = paint_queued_[sdl_window_id];
++    if (queued) {
++      return;
++    }
++    queued = true;
+   }
+   SDL_Event event;
+   SDL_zero(event);
+   event.type = paint_event_type_;
+   event.user.windowID = sdl_window_id;
+-  if (SDL_PushEvent(&event)) {
+-    queued = true;
++  if (!SDL_PushEvent(&event)) {
++    std::lock_guard<std::mutex> lock(paint_queued_mutex_);
++    paint_queued_[sdl_window_id] = false;
+   }
+ }
+ 
+@@ -118,7 +127,11 @@ void SDLWindowedAppContext::DispatchEvent(const SDL_Event& event) {
+     return;
+   }
+   if (event.type == paint_event_type_) {
+-    paint_queued_[event.user.windowID] = false;
++    {
++      // Cleared before painting, so a request made during the paint queues another one.
++      std::lock_guard<std::mutex> lock(paint_queued_mutex_);
++      paint_queued_[event.user.windowID] = false;
++    }
+     auto it = windows_.find(event.user.windowID);
+     if (it != windows_.end()) {
+       it->second->HandlePaintEvent();
+-- 
+2.54.0 (Apple Git-157)
+
