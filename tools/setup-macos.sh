@@ -19,6 +19,7 @@
 #                     PPC_BINUTILS_DIR (build it with tools/build-ppc-binutils-macos.sh)
 #   PPC_BINUTILS_DIR  folder holding powerpc-none-elf-{as,ld,nm} (only with REXGLUE_TESTS=1)
 #   CONFIG            build configuration (default RelWithDebInfo)
+#   KEEP_GOING=1      keep building past failed files, so one run reports every error (CI)
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
@@ -28,6 +29,10 @@ REXGLUE_URL=${REXGLUE_URL:-https://github.com/HollywoodAkeem/rexglue-sdk-yukes.g
 BUILD_JOBS=${BUILD_JOBS:-$(sysctl -n hw.perflevel0.physicalcpu 2>/dev/null || sysctl -n hw.ncpu)}
 CONFIG=${CONFIG:-RelWithDebInfo}
 REXGLUE_TESTS=${REXGLUE_TESTS:-0}
+NINJA_ARGS=()
+if [ "${KEEP_GOING:-0}" = "1" ]; then
+  NINJA_ARGS=(-- -k 0)
+fi
 
 if [ "$(uname -s)" != "Darwin" ] || [ "$(uname -m)" != "arm64" ]; then
   echo "This script is for macOS on Apple silicon (arm64). On Linux use tools/setup.sh." >&2
@@ -86,13 +91,14 @@ if [ ! -f "$BUILD_DIR/CMakeCache.txt" ]; then
     -DREXGLUE_ENABLE_SANITIZERS=OFF -DREXGLUE_ENABLE_TRACY=OFF -DREXGLUE_FFMPEG_SHARED=ON \
     -DREXGLUE_PROFILE_GUEST_FUNCTIONS=OFF -DREXGLUE_USE_VULKAN=ON
 fi
-cmake --build "$BUILD_DIR" --config "$CONFIG" --target install -j "$BUILD_JOBS"
+cmake --build "$BUILD_DIR" --config "$CONFIG" --target install -j "$BUILD_JOBS" ${NINJA_ARGS[@]+"${NINJA_ARGS[@]}"}
 
 REXGLUE_BIN="$SDK/out/macos-arm64/$CONFIG/rexglue"
 test -x "$REXGLUE_BIN" || { echo "ReXGlue binary was not produced: $REXGLUE_BIN" >&2; exit 1; }
 
 if [ "$REXGLUE_TESTS" = "1" ]; then
-  cmake --build "$BUILD_DIR" --config "$CONFIG" --target unit_tests ppc_tests rex_smoke -j "$BUILD_JOBS"
+  cmake --build "$BUILD_DIR" --config "$CONFIG" --target unit_tests ppc_tests rex_smoke -j "$BUILD_JOBS" \
+    ${NINJA_ARGS[@]+"${NINJA_ARGS[@]}"}
 fi
 
 echo "ReXGlue fetched, patched, built and installed for macOS: $SDK/out/install/macos-arm64"

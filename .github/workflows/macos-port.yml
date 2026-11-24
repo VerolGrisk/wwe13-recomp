@@ -49,6 +49,7 @@ jobs:
       - name: Fetch, patch and build ReXGlue with tests
         env:
           REXGLUE_TESTS: "1"
+          KEEP_GOING: "1"
           PPC_BINUTILS_DIR: ${{ runner.temp }}/ppc-binutils/bin
           BUILD_JOBS: "3"
         run: |

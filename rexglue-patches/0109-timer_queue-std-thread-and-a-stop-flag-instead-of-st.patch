@@ -1,0 +1,93 @@
+From 3063564616a91ec941cc997b5addf23402381b12 Mon Sep 17 00:00:00 2001
+From: WWE13 Recomp <wwe13-recomp@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 20:01:51 -0500
+Subject: [PATCH] timer_queue: std::thread and a stop flag instead of
+ std::jthread
+
+libc++ before 20 (Xcode 16, the macOS CI runner) keeps std::jthread and
+std::stop_token behind -fexperimental-library, so timer_queue.cpp failed
+to compile there. The dispatch thread is now a std::thread with an
+atomic stop flag, joined explicitly in the destructor (the same order
+std::jthread's auto-join gave: before the other members are destroyed).
+Same behaviour on every platform.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/core/timer_queue.cpp | 21 +++++++++++++--------
+ 1 file changed, 13 insertions(+), 8 deletions(-)
+
+diff --git a/src/core/timer_queue.cpp b/src/core/timer_queue.cpp
+index cf347af..e15360a 100644
+--- a/src/core/timer_queue.cpp
++++ b/src/core/timer_queue.cpp
+@@ -11,6 +11,7 @@
+ 
+ #include <algorithm>
+ #include <forward_list>
++#include <thread>
+ 
+ #include <disruptorplus/multi_threaded_claim_strategy.hpp>
+ #include <disruptorplus/ring_buffer.hpp>
+@@ -39,12 +40,13 @@ class TimerQueue {
+         claim_strategy_(kWaitCount, wait_strategy_),
+         consumed_(wait_strategy_) {
+     claim_strategy_.add_claim_barrier(consumed_);
+-    dispatch_thread_ =
+-        std::jthread([this](std::stop_token stop_token) { TimerThreadMain(stop_token); });
++    // std::thread plus a stop flag rather than std::jthread: libc++ before 20 (Xcode 16) keeps
++    // jthread and stop_token behind -fexperimental-library.
++    dispatch_thread_ = std::thread([this]() { TimerThreadMain(); });
+   }
+ 
+   ~TimerQueue() {
+-    dispatch_thread_.request_stop();
++    stop_requested_.store(true, std::memory_order_release);
+ 
+     // Kick dispatch thread to check stop token
+     auto wait_item = std::make_shared<WaitItem>(nullptr, nullptr, this, clock::time_point::min(),
+@@ -52,10 +54,12 @@ class TimerQueue {
+     wait_item->Disarm();
+     QueueTimer(std::move(wait_item));
+ 
+-    // std::jthread auto-joins on destruction
++    if (dispatch_thread_.joinable()) {
++      dispatch_thread_.join();
++    }
+   }
+ 
+-  void TimerThreadMain(std::stop_token stop_token) {
++  void TimerThreadMain() {
+     dp::sequence_t next_sequence = 0;
+     const auto comp = [](const std::shared_ptr<WaitItem>& left,
+                          const std::shared_ptr<WaitItem>& right) {
+@@ -64,7 +68,7 @@ class TimerQueue {
+ 
+     set_current_thread_name("rex::thread::TimerQueue");
+ 
+-    while (!stop_token.stop_requested()) {
++    while (!stop_requested_.load(std::memory_order_acquire)) {
+       {
+         // Consume new wait items and add them to sorted wait queue
+         dp::sequence_t available = claim_strategy_.wait_until_published(
+@@ -136,7 +140,7 @@ class TimerQueue {
+     return wait_item_weak;
+   }
+ 
+-  std::jthread::id dispatch_thread_id() const { return dispatch_thread_.get_id(); }
++  std::thread::id dispatch_thread_id() const { return dispatch_thread_.get_id(); }
+ 
+  private:
+   // This ring buffer will be used to introduce timers queued by the public API
+@@ -149,7 +153,8 @@ class TimerQueue {
+   // This is a _sorted_ (ascending due_) list of active timers managed by a
+   // dedicated thread
+   std::forward_list<std::shared_ptr<WaitItem>> wait_queue_;
+-  std::jthread dispatch_thread_;
++  std::atomic<bool> stop_requested_{false};
++  std::thread dispatch_thread_;
+ };
+ 
+ rex::thread::TimerQueue timer_queue_;
+-- 
+2.54.0 (Apple Git-157)
+
