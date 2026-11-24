@@ -1,0 +1,754 @@
+From 3f5006038b7c83f1e4ac22d4dcb10b4b295a89c5 Mon Sep 17 00:00:00 2001
+From: WWE13 Recomp <wwe13-recomp@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 19:30:27 -0500
+Subject: [PATCH] apple: first native macOS build fixes (Xcode 27, Apple
+ silicon)
+
+Build fixes found by building on a Mac (Xcode 27.2, macOS 27, arm64).
+Linux and Windows behaviour is unchanged.
+
+Linking: FFmpeg shared libraries export av* (and ff_reverse) through
+ld64's -exported_symbols_list instead of GNU --version-script. unit_tests
+and rex_smoke link rexsystem directly on Apple, because CMake has no
+$<LINK_GROUP:RESCAN> for ld64 (and ld64 needs no archive rescans).
+
+libc++: Apple's libc++ has neither std::move_only_function nor
+std::chrono::clock_cast. Add rex::move_only_function (an alias of the
+std type where the library has it, otherwise a minimal type-erased
+replacement) and rex::chrono::clock_time_conversion / clock_cast for
+ReXGlue's own clocks, and use them on every platform.
+
+Darwin code that 0104 missed:
+- memory_posix: the mach_vm_region helpers were nested inside
+  #if REX_PLATFORM_LINUX and never compiled; Protect also reports the old
+  access on Darwin. page_size uses sysconf (getpagesize is hidden by
+  _XOPEN_SOURCE).
+- filesystem_posix, mapped_memory_posix: map the *64 file functions to
+  the plain ones (off_t and struct stat are always 64-bit on Darwin).
+- dynlib: macOS library names; the Vulkan loader is also tried next to
+  the executable, in an app bundle's Frameworks and in the Homebrew and
+  /usr/local prefixes.
+- renderdoc_app.h: Apple calling convention (as upstream RenderDoc).
+- xam_net: socket headers on every POSIX platform, plus <sys/select.h>.
+- xsocket: Darwin defines IPPROTO_UDP as a numeric macro, which broke the
+  qualified enum name.
+- sha256: <machine/endian.h> on Apple.
+- heap, disruptorplus: explicit std::min/max types (size_t and uint64_t
+  are different types on Darwin).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ include/rex/chrono/chrono.h                   | 15 +++-
+ include/rex/chrono/chrono_steady_cast.h       |  4 +-
+ include/rex/move_only_function.h              | 90 +++++++++++++++++++
+ include/rex/platform/dynlib.h                 | 14 +++
+ include/rex/system/kernel_state.h             | 27 +++---
+ include/rex/thread/timer_queue.h              |  9 +-
+ src/core/filesystem_posix.cpp                 | 11 +++
+ src/core/mapped_memory_posix.cpp              | 11 +++
+ src/core/memory_posix.cpp                     | 13 ++-
+ src/core/threading_posix.cpp                  |  4 +-
+ src/core/threading_win.cpp                    |  4 +-
+ src/core/timer_queue.cpp                      |  4 +-
+ src/kernel/crt/heap.cpp                       |  2 +-
+ src/kernel/xam/xam_net.cpp                    |  3 +-
+ src/system/kernel_state.cpp                   | 22 ++---
+ src/system/xsocket.cpp                        |  4 +-
+ src/system/xtimer.cpp                         |  4 +-
+ src/ui/vulkan/vulkan_instance.cpp             | 11 ++-
+ tests/smoke/CMakeLists.txt                    |  3 +-
+ tests/unit/CMakeLists.txt                     |  5 +-
+ thirdparty/CMakeLists.txt                     | 12 +++
+ thirdparty/crypto/sha256.cpp                  |  4 +-
+ .../multi_threaded_claim_strategy.hpp         |  2 +-
+ thirdparty/renderdoc/renderdoc_app.h          |  2 +-
+ 24 files changed, 228 insertions(+), 52 deletions(-)
+ create mode 100644 include/rex/move_only_function.h
+
+diff --git a/include/rex/chrono/chrono.h b/include/rex/chrono/chrono.h
+index 8761cff..0dc6c78 100644
+--- a/include/rex/chrono/chrono.h
++++ b/include/rex/chrono/chrono.h
+@@ -111,10 +111,21 @@ using WinSystemClock = detail::NtSystemClock<detail::Domain::Host>;
+ // Guest system clock, scaled
+ using XSystemClock = detail::NtSystemClock<detail::Domain::Guest>;
+ 
++// clock_time_conversion / clock_cast for ReXGlue's own clocks. std::chrono::clock_cast is
++// missing from Apple's libc++, and only these explicit conversions are ever needed (never the
++// standard sys/utc fallbacks), so ReXGlue dispatches to its specializations directly.
++template <typename DestClock, typename SourceClock>
++struct clock_time_conversion;
++
++template <typename DestClock, typename SourceClock, typename Duration>
++auto clock_cast(const std::chrono::time_point<SourceClock, Duration>& t) {
++  return clock_time_conversion<DestClock, SourceClock>{}(t);
++}
++
+ }  // namespace chrono
+ }  // namespace rex
+ 
+-namespace std::chrono {
++namespace rex::chrono {
+ 
+ template <>
+ struct clock_time_conversion<::rex::chrono::WinSystemClock, ::rex::chrono::XSystemClock> {
+@@ -162,4 +173,4 @@ struct clock_time_conversion<::rex::chrono::XSystemClock, ::rex::chrono::WinSyst
+   }
+ };
+ 
+-}  // namespace std::chrono
++}  // namespace rex::chrono
+diff --git a/include/rex/chrono/chrono_steady_cast.h b/include/rex/chrono/chrono_steady_cast.h
+index 8401109..a2a120c 100644
+--- a/include/rex/chrono/chrono_steady_cast.h
++++ b/include/rex/chrono/chrono_steady_cast.h
+@@ -20,7 +20,7 @@
+ // epoch as a steady clock in waits. In such cases, include this header and use
+ // clock_cast<>().
+ 
+-namespace std::chrono {
++namespace rex::chrono {
+ 
+ // This conveniently works only for Host time domain because Guest needs
+ // additional scaling. Convert XSystemClock to WinSystemClock first if
+@@ -70,4 +70,4 @@ struct clock_time_conversion<std::chrono::steady_clock, ::rex::chrono::WinSystem
+   }
+ };
+ 
+-}  // namespace std::chrono
++}  // namespace rex::chrono
+diff --git a/include/rex/move_only_function.h b/include/rex/move_only_function.h
+new file mode 100644
+index 0000000..4f3ec28
+--- /dev/null
++++ b/include/rex/move_only_function.h
+@@ -0,0 +1,90 @@
++/**
++ * @file        rex/move_only_function.h
++ * @brief       rex::move_only_function: std::move_only_function where the standard library
++ *              provides it, otherwise a minimal replacement.
++ *
++ * Apple's libc++ (Xcode 27 included) does not ship C++23 std::move_only_function. The fallback
++ * covers what ReXGlue uses: unqualified signatures R(Args...), construction from nullptr or any
++ * move-constructible callable, move, operator bool and a call operator that may mutate the
++ * stored callable.
++ */
++
++#pragma once
++
++#include <cstddef>
++#include <functional>
++#include <memory>
++#include <type_traits>
++#include <utility>
++
++namespace rex {
++
++#if defined(__cpp_lib_move_only_function) && __cpp_lib_move_only_function >= 202110L
++
++template <typename Signature>
++using move_only_function = std::move_only_function<Signature>;
++
++#else
++
++template <typename Signature>
++class move_only_function;
++
++template <typename R, typename... Args>
++class move_only_function<R(Args...)> {
++ public:
++  move_only_function() noexcept = default;
++  move_only_function(std::nullptr_t) noexcept {}
++  move_only_function(move_only_function&&) noexcept = default;
++  move_only_function& operator=(move_only_function&&) noexcept = default;
++  move_only_function(const move_only_function&) = delete;
++  move_only_function& operator=(const move_only_function&) = delete;
++  move_only_function& operator=(std::nullptr_t) noexcept {
++    callable_.reset();
++    return *this;
++  }
++
++  template <typename F, typename D = std::decay_t<F>,
++            typename = std::enable_if_t<!std::is_same_v<D, move_only_function> &&
++                                        std::is_invocable_r_v<R, D&, Args...>>>
++  move_only_function(F&& f) {
++    if constexpr (std::is_pointer_v<D> || std::is_member_pointer_v<D>) {
++      if (f == nullptr) {
++        return;
++      }
++    } else if constexpr (requires(const D& d) { static_cast<bool>(d == nullptr); }) {
++      // Empty std::function / move_only_function stays empty, as in the standard.
++      if (f == nullptr) {
++        return;
++      }
++    }
++    callable_ = std::make_unique<Model<D>>(std::forward<F>(f));
++  }
++
++  explicit operator bool() const noexcept { return callable_ != nullptr; }
++  friend bool operator==(const move_only_function& f, std::nullptr_t) noexcept { return !f; }
++
++  R operator()(Args... args) { return callable_->Invoke(std::forward<Args>(args)...); }
++
++  void swap(move_only_function& other) noexcept { callable_.swap(other.callable_); }
++
++ private:
++  struct Concept {
++    virtual ~Concept() = default;
++    virtual R Invoke(Args&&... args) = 0;
++  };
++  template <typename F>
++  struct Model final : Concept {
++    template <typename G>
++    explicit Model(G&& g) : f(std::forward<G>(g)) {}
++    R Invoke(Args&&... args) override {
++      return std::invoke_r<R>(f, std::forward<Args>(args)...);
++    }
++    F f;
++  };
++
++  std::unique_ptr<Concept> callable_;
++};
++
++#endif
++
++}  // namespace rex
+diff --git a/include/rex/platform/dynlib.h b/include/rex/platform/dynlib.h
+index c30ae1c..f3b3c6e 100644
+--- a/include/rex/platform/dynlib.h
++++ b/include/rex/platform/dynlib.h
+@@ -56,6 +56,20 @@ inline constexpr const char* kVulkanLoader = "libvulkan.so.1";
+ inline constexpr const char* kRenderDoc = "librenderdoc.so";
+ inline constexpr const char* kSpirvToolsSdkPath = "bin/libSPIRV-Tools-shared.so";
+ 
++#elif REX_PLATFORM_MAC
++
++// dlopen of a bare name does not search Homebrew's prefix or an app bundle, so the Vulkan
++// loader is also tried at the places listed in kVulkanLoaderFallbacks.
++inline constexpr const char* kVulkanLoader = "libvulkan.1.dylib";
++inline constexpr const char* kVulkanLoaderFallbacks[] = {
++    "@executable_path/libvulkan.1.dylib",
++    "@executable_path/../Frameworks/libvulkan.1.dylib",
++    "/opt/homebrew/lib/libvulkan.1.dylib",
++    "/usr/local/lib/libvulkan.1.dylib",
++};
++inline constexpr const char* kRenderDoc = "librenderdoc.dylib";
++inline constexpr const char* kSpirvToolsSdkPath = "lib/libSPIRV-Tools-shared.dylib";
++
+ #else
+ #error No library names provided for the target platform.
+ #endif
+diff --git a/include/rex/system/kernel_state.h b/include/rex/system/kernel_state.h
+index 269e8fe..bec7494 100644
+--- a/include/rex/system/kernel_state.h
++++ b/include/rex/system/kernel_state.h
+@@ -10,6 +10,7 @@
+  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+  */
+ 
++#include <rex/move_only_function.h>
+ #include <atomic>
+ #include <condition_variable>
+ #include <functional>
+@@ -284,24 +285,24 @@ class KernelState {
+   void CompleteOverlappedImmediateEx(uint32_t overlapped_ptr, X_RESULT result,
+                                      uint32_t extended_error, uint32_t length);
+ 
+-  void CompleteOverlappedDeferred(std::move_only_function<void()> completion_callback,
++  void CompleteOverlappedDeferred(rex::move_only_function<void()> completion_callback,
+                                   uint32_t overlapped_ptr, X_RESULT result,
+-                                  std::move_only_function<void()> pre_callback = nullptr,
+-                                  std::move_only_function<void()> post_callback = nullptr);
+-  void CompleteOverlappedDeferredEx(std::move_only_function<void()> completion_callback,
++                                  rex::move_only_function<void()> pre_callback = nullptr,
++                                  rex::move_only_function<void()> post_callback = nullptr);
++  void CompleteOverlappedDeferredEx(rex::move_only_function<void()> completion_callback,
+                                     uint32_t overlapped_ptr, X_RESULT result,
+                                     uint32_t extended_error, uint32_t length,
+-                                    std::move_only_function<void()> pre_callback = nullptr,
+-                                    std::move_only_function<void()> post_callback = nullptr);
++                                    rex::move_only_function<void()> pre_callback = nullptr,
++                                    rex::move_only_function<void()> post_callback = nullptr);
+ 
+-  void CompleteOverlappedDeferred(std::move_only_function<X_RESULT()> completion_callback,
++  void CompleteOverlappedDeferred(rex::move_only_function<X_RESULT()> completion_callback,
+                                   uint32_t overlapped_ptr,
+-                                  std::move_only_function<void()> pre_callback = nullptr,
+-                                  std::move_only_function<void()> post_callback = nullptr);
++                                  rex::move_only_function<void()> pre_callback = nullptr,
++                                  rex::move_only_function<void()> post_callback = nullptr);
+   void CompleteOverlappedDeferredEx(
+-      std::move_only_function<X_RESULT(uint32_t&, uint32_t&)> completion_callback,
+-      uint32_t overlapped_ptr, std::move_only_function<void()> pre_callback = nullptr,
+-      std::move_only_function<void()> post_callback = nullptr);
++      rex::move_only_function<X_RESULT(uint32_t&, uint32_t&)> completion_callback,
++      uint32_t overlapped_ptr, rex::move_only_function<void()> pre_callback = nullptr,
++      rex::move_only_function<void()> post_callback = nullptr);
+ 
+   bool Save(stream::ByteStream* stream);
+   bool Restore(stream::ByteStream* stream);
+@@ -351,7 +352,7 @@ class KernelState {
+   // Must be guarded by the global critical region.
+   util::NativeList dpc_list_;
+   std::condition_variable_any dispatch_cond_;
+-  std::list<std::move_only_function<void()>> dispatch_queue_;
++  std::list<rex::move_only_function<void()>> dispatch_queue_;
+ 
+   friend class XObject;
+ };
+diff --git a/include/rex/thread/timer_queue.h b/include/rex/thread/timer_queue.h
+index cb2e84a..cffd16b 100644
+--- a/include/rex/thread/timer_queue.h
++++ b/include/rex/thread/timer_queue.h
+@@ -11,6 +11,7 @@
+ 
+ #pragma once
+ 
++#include <rex/move_only_function.h>
+ #include <atomic>
+ #include <chrono>
+ #include <functional>
+@@ -26,7 +27,7 @@ class TimerQueue;
+ struct TimerQueueWaitItem {
+   using clock = std::chrono::steady_clock;
+ 
+-  TimerQueueWaitItem(std::move_only_function<void(void*)> callback, void* userdata,
++  TimerQueueWaitItem(rex::move_only_function<void(void*)> callback, void* userdata,
+                      TimerQueue* parent_queue, clock::time_point due, clock::duration interval)
+       : callback_(std::move(callback)),
+         userdata_(userdata),
+@@ -55,7 +56,7 @@ struct TimerQueueWaitItem {
+   };
+   static_assert(std::atomic<State>::is_always_lock_free);
+ 
+-  std::move_only_function<void(void*)> callback_;
++  rex::move_only_function<void(void*)> callback_;
+   void* userdata_;
+   TimerQueue* parent_queue_;
+   clock::time_point due_;
+@@ -63,14 +64,14 @@ struct TimerQueueWaitItem {
+   std::atomic<State> state_;
+ };
+ 
+-std::weak_ptr<TimerQueueWaitItem> QueueTimerOnce(std::move_only_function<void(void*)> callback,
++std::weak_ptr<TimerQueueWaitItem> QueueTimerOnce(rex::move_only_function<void(void*)> callback,
+                                                  void* userdata,
+                                                  TimerQueueWaitItem::clock::time_point due);
+ 
+ // Callback is first executed at due, then again repeatedly after interval
+ // passes (unless interval == 0). The first callback will be scheduled at
+ // `max(now() - interval, due)` to mitigate callback flooding.
+-std::weak_ptr<TimerQueueWaitItem> QueueTimerRecurring(std::move_only_function<void(void*)> callback,
++std::weak_ptr<TimerQueueWaitItem> QueueTimerRecurring(rex::move_only_function<void(void*)> callback,
+                                                       void* userdata,
+                                                       TimerQueueWaitItem::clock::time_point due,
+                                                       TimerQueueWaitItem::clock::duration interval);
+diff --git a/src/core/filesystem_posix.cpp b/src/core/filesystem_posix.cpp
+index f939256..6700ac3 100644
+--- a/src/core/filesystem_posix.cpp
++++ b/src/core/filesystem_posix.cpp
+@@ -36,6 +36,17 @@
+ #endif
+ #include <pwd.h>
+ 
++
++#if REX_PLATFORM_MAC
++// Darwin has no *64 variants: off_t and struct stat are always 64-bit.
++#define off64_t off_t
++#define fseeko64 fseeko
++#define ftello64 ftello
++#define ftruncate64 ftruncate
++#define stat64 stat
++#define fstat64 fstat
++#endif
++
+ namespace rex {
+ 
+ std::string path_to_utf8(const std::filesystem::path& path) {
+diff --git a/src/core/mapped_memory_posix.cpp b/src/core/mapped_memory_posix.cpp
+index 92c06c8..895d42a 100644
+--- a/src/core/mapped_memory_posix.cpp
++++ b/src/core/mapped_memory_posix.cpp
+@@ -20,6 +20,17 @@
+ #include <rex/memory/mapped_memory.h>
+ #include <rex/platform.h>
+ 
++
++#if REX_PLATFORM_MAC
++// Darwin has no *64 variants: off_t and struct stat are always 64-bit.
++#define off64_t off_t
++#define fseeko64 fseeko
++#define ftello64 ftello
++#define ftruncate64 ftruncate
++#define stat64 stat
++#define fstat64 fstat
++#endif
++
+ namespace rex::memory {
+ 
+ class PosixMappedMemory : public MappedMemory {
+diff --git a/src/core/memory_posix.cpp b/src/core/memory_posix.cpp
+index 9da80b4..40a1210 100644
+--- a/src/core/memory_posix.cpp
++++ b/src/core/memory_posix.cpp
+@@ -105,7 +105,12 @@ void AndroidShutdown() {
+ #endif
+ 
+ size_t page_size() {
++#if REX_PLATFORM_MAC
++  // getpagesize is hidden by _XOPEN_SOURCE on Darwin (16 KB pages on Apple silicon).
++  return static_cast<size_t>(sysconf(_SC_PAGESIZE));
++#else
+   return getpagesize();
++#endif
+ }
+ size_t allocation_granularity() {
+   return page_size();
+@@ -134,7 +139,7 @@ bool IsWritableExecutableMemorySupported() {
+ }
+ 
+ // TODO(tomc): this needs to go somewhere else. we should utilize the platform namespace more.
+-#if REX_PLATFORM_LINUX
++#if REX_PLATFORM_LINUX || REX_PLATFORM_MAC
+ namespace {
+ 
+ struct LinuxMapEntry {
+@@ -143,6 +148,7 @@ struct LinuxMapEntry {
+   char perms[5] = {};
+ };
+ 
++#if REX_PLATFORM_LINUX
+ // Parse a line from /proc/self/maps into a LinuxMapEntry
+ static bool ParseProcMapsLine(const std::string& line, LinuxMapEntry& out) {
+   out = LinuxMapEntry{};
+@@ -156,6 +162,7 @@ static bool ParseProcMapsLine(const std::string& line, LinuxMapEntry& out) {
+   std::memcpy(out.perms, perms, sizeof(out.perms));
+   return out.start < out.end;
+ }
++#endif  // REX_PLATFORM_LINUX
+ 
+ #if REX_PLATFORM_MAC
+ // Darwin has no /proc/self/maps; mach_vm_region returns the region at or above an address with
+@@ -281,7 +288,7 @@ static PageAccess PermsToPageAccess(const char perms[5]) {
+ }
+ 
+ }  // namespace
+-#endif  // REX_PLATFORM_LINUX
++#endif  // REX_PLATFORM_LINUX || REX_PLATFORM_MAC
+ 
+ void* AllocFixed(void* base_address, size_t length, AllocationType allocation_type,
+                  PageAccess access) {
+@@ -382,7 +389,7 @@ bool Protect(void* base_address, size_t length, PageAccess access, PageAccess* o
+     *out_old_access = PageAccess::kNoAccess;
+   }
+ 
+-#if REX_PLATFORM_LINUX
++#if REX_PLATFORM_LINUX || REX_PLATFORM_MAC
+   // NOTE(tomc): we may want to look at doing this differently. it should work for now
+   //             but there is a TOCTOU window between reading and changing.
+   //             This really shouldn't be an issue since VirtualProtect on Windows isn't truly
+diff --git a/src/core/threading_posix.cpp b/src/core/threading_posix.cpp
+index 9b0a4fd..4757c8e 100644
+--- a/src/core/threading_posix.cpp
++++ b/src/core/threading_posix.cpp
+@@ -1326,7 +1326,7 @@ class PosixTimer : public PosixConditionHandle<Timer> {
+   }
+   bool SetOnceAt(WClock_::time_point due_time,
+                  std::function<void()> opt_callback = nullptr) override {
+-    return SetOnceAt(std::chrono::clock_cast<GClock_>(due_time), std::move(opt_callback));
++    return SetOnceAt(rex::chrono::clock_cast<GClock_>(due_time), std::move(opt_callback));
+   };
+   bool SetOnceAt(GClock_::time_point due_time,
+                  std::function<void()> opt_callback = nullptr) override {
+@@ -1340,7 +1340,7 @@ class PosixTimer : public PosixConditionHandle<Timer> {
+   }
+   bool SetRepeatingAt(WClock_::time_point due_time, std::chrono::milliseconds period,
+                       std::function<void()> opt_callback = nullptr) override {
+-    return SetRepeatingAt(std::chrono::clock_cast<GClock_>(due_time), period,
++    return SetRepeatingAt(rex::chrono::clock_cast<GClock_>(due_time), period,
+                           std::move(opt_callback));
+   }
+   bool SetRepeatingAt(GClock_::time_point due_time, std::chrono::milliseconds period,
+diff --git a/src/core/threading_win.cpp b/src/core/threading_win.cpp
+index 1cb2cd2..4933081 100644
+--- a/src/core/threading_win.cpp
++++ b/src/core/threading_win.cpp
+@@ -400,7 +400,7 @@ class Win32Timer : public Win32Handle<Timer> {
+     return SetOnceAt(WClock_::now() + rel_time, std::move(opt_callback));
+   }
+   bool SetOnceAt(GClock_::time_point due_time, std::function<void()> opt_callback) override {
+-    return SetOnceAt(std::chrono::clock_cast<WClock_>(due_time), std::move(opt_callback));
++    return SetOnceAt(rex::chrono::clock_cast<WClock_>(due_time), std::move(opt_callback));
+   }
+   bool SetOnceAt(WClock_::time_point due_time, std::function<void()> opt_callback) override {
+     std::lock_guard<std::mutex> lock(mutex_);
+@@ -419,7 +419,7 @@ class Win32Timer : public Win32Handle<Timer> {
+   }
+   bool SetRepeatingAt(GClock_::time_point due_time, std::chrono::milliseconds period,
+                       std::function<void()> opt_callback = nullptr) {
+-    return SetRepeatingAt(std::chrono::clock_cast<WClock_>(due_time), period,
++    return SetRepeatingAt(rex::chrono::clock_cast<WClock_>(due_time), period,
+                           std::move(opt_callback));
+   }
+   bool SetRepeatingAt(WClock_::time_point due_time, std::chrono::milliseconds period,
+diff --git a/src/core/timer_queue.cpp b/src/core/timer_queue.cpp
+index d079ec7..cf347af 100644
+--- a/src/core/timer_queue.cpp
++++ b/src/core/timer_queue.cpp
+@@ -187,13 +187,13 @@ void TimerQueueWaitItem::Disarm() {
+   }
+ }
+ 
+-std::weak_ptr<WaitItem> QueueTimerOnce(std::move_only_function<void(void*)> callback,
++std::weak_ptr<WaitItem> QueueTimerOnce(rex::move_only_function<void(void*)> callback,
+                                        void* userdata, WaitItem::clock::time_point due) {
+   return timer_queue_.QueueTimer(std::make_shared<WaitItem>(
+       std::move(callback), userdata, &timer_queue_, due, WaitItem::clock::duration::zero()));
+ }
+ 
+-std::weak_ptr<WaitItem> QueueTimerRecurring(std::move_only_function<void(void*)> callback,
++std::weak_ptr<WaitItem> QueueTimerRecurring(rex::move_only_function<void(void*)> callback,
+                                             void* userdata, WaitItem::clock::time_point due,
+                                             WaitItem::clock::duration interval) {
+   return timer_queue_.QueueTimer(
+diff --git a/src/kernel/crt/heap.cpp b/src/kernel/crt/heap.cpp
+index b1f1781..1abc840 100644
+--- a/src/kernel/crt/heap.cpp
++++ b/src/kernel/crt/heap.cpp
+@@ -342,7 +342,7 @@ HeapDiagnostics ReXHeap::GetDiagnosticsLocked() const {
+     diagnostics.capacity += d.capacity;
+     diagnostics.allocated += d.allocated;
+     diagnostics.peak_allocated += d.peak_allocated;
+-    diagnostics.peak_request_size = std::max(diagnostics.peak_request_size, d.peak_request_size);
++    diagnostics.peak_request_size = std::max<uint64_t>(diagnostics.peak_request_size, d.peak_request_size);
+     diagnostics.oom_count += d.oom_count;
+   }
+   return diagnostics;
+diff --git a/src/kernel/xam/xam_net.cpp b/src/kernel/xam/xam_net.cpp
+index 0eadea9..c50c96a 100644
+--- a/src/kernel/xam/xam_net.cpp
++++ b/src/kernel/xam/xam_net.cpp
+@@ -33,10 +33,11 @@
+ // NOTE: must be included last as it expects windows.h to already be included.
+ #define _WINSOCK_DEPRECATED_NO_WARNINGS  // inet_addr
+ #include <winsock2.h>                    // NOLINT(build/include_order)
+-#elif REX_PLATFORM_LINUX
++#else
+ #include <arpa/inet.h>
+ #include <netinet/in.h>
+ #include <netinet/ip.h>
++#include <sys/select.h>
+ #include <sys/socket.h>
+ #endif
+ 
+diff --git a/src/system/kernel_state.cpp b/src/system/kernel_state.cpp
+index b9e9c83..b5f7561 100644
+--- a/src/system/kernel_state.cpp
++++ b/src/system/kernel_state.cpp
+@@ -875,19 +875,19 @@ void KernelState::CompleteOverlappedImmediateEx(uint32_t overlapped_ptr, X_RESUL
+   CompleteOverlappedEx(overlapped_ptr, result, extended_error, length);
+ }
+ 
+-void KernelState::CompleteOverlappedDeferred(std::move_only_function<void()> completion_callback,
++void KernelState::CompleteOverlappedDeferred(rex::move_only_function<void()> completion_callback,
+                                              uint32_t overlapped_ptr, X_RESULT result,
+-                                             std::move_only_function<void()> pre_callback,
+-                                             std::move_only_function<void()> post_callback) {
++                                             rex::move_only_function<void()> pre_callback,
++                                             rex::move_only_function<void()> post_callback) {
+   CompleteOverlappedDeferredEx(std::move(completion_callback), overlapped_ptr, result, result, 0,
+                                std::move(pre_callback), std::move(post_callback));
+ }
+ 
+-void KernelState::CompleteOverlappedDeferredEx(std::move_only_function<void()> completion_callback,
++void KernelState::CompleteOverlappedDeferredEx(rex::move_only_function<void()> completion_callback,
+                                                uint32_t overlapped_ptr, X_RESULT result,
+                                                uint32_t extended_error, uint32_t length,
+-                                               std::move_only_function<void()> pre_callback,
+-                                               std::move_only_function<void()> post_callback) {
++                                               rex::move_only_function<void()> pre_callback,
++                                               rex::move_only_function<void()> post_callback) {
+   CompleteOverlappedDeferredEx(
+       [completion_callback = std::move(completion_callback), result, extended_error, length](
+           uint32_t& cb_extended_error, uint32_t& cb_length) mutable -> X_RESULT {
+@@ -900,8 +900,8 @@ void KernelState::CompleteOverlappedDeferredEx(std::move_only_function<void()> c
+ }
+ 
+ void KernelState::CompleteOverlappedDeferred(
+-    std::move_only_function<X_RESULT()> completion_callback, uint32_t overlapped_ptr,
+-    std::move_only_function<void()> pre_callback, std::move_only_function<void()> post_callback) {
++    rex::move_only_function<X_RESULT()> completion_callback, uint32_t overlapped_ptr,
++    rex::move_only_function<void()> pre_callback, rex::move_only_function<void()> post_callback) {
+   CompleteOverlappedDeferredEx(
+       [completion_callback = std::move(completion_callback)](uint32_t& extended_error,
+                                                              uint32_t& length) mutable -> X_RESULT {
+@@ -914,9 +914,9 @@ void KernelState::CompleteOverlappedDeferred(
+ }
+ 
+ void KernelState::CompleteOverlappedDeferredEx(
+-    std::move_only_function<X_RESULT(uint32_t&, uint32_t&)> completion_callback,
+-    uint32_t overlapped_ptr, std::move_only_function<void()> pre_callback,
+-    std::move_only_function<void()> post_callback) {
++    rex::move_only_function<X_RESULT(uint32_t&, uint32_t&)> completion_callback,
++    uint32_t overlapped_ptr, rex::move_only_function<void()> pre_callback,
++    rex::move_only_function<void()> post_callback) {
+   REXSYS_DEBUG("CompleteOverlappedDeferredEx: queuing for overlapped {:08X}", overlapped_ptr);
+   auto ptr = memory()->TranslateVirtual(overlapped_ptr);
+   XOverlappedSetResult(ptr, X_ERROR_IO_PENDING);
+diff --git a/src/system/xsocket.cpp b/src/system/xsocket.cpp
+index 0b44e06..8fa5329 100644
+--- a/src/system/xsocket.cpp
++++ b/src/system/xsocket.cpp
+@@ -49,7 +49,9 @@ X_STATUS XSocket::Initialize(AddressFamily af, Type type, Protocol proto) {
+ 
+   if (proto == Protocol::IPPROTO_VDP) {
+     // VDP is a layer on top of UDP.
+-    proto = Protocol::IPPROTO_UDP;
++    // Darwin's <netinet/in.h> makes IPPROTO_UDP a numeric macro, so it cannot be written
++    // qualified here; the Xbox and host values are the same (17).
++    proto = static_cast<Protocol>(17);
+   }
+ 
+   native_handle_ = socket(af, type, proto);
+diff --git a/src/system/xtimer.cpp b/src/system/xtimer.cpp
+index 2e499a1..3123c1d 100644
+--- a/src/system/xtimer.cpp
++++ b/src/system/xtimer.cpp
+@@ -52,9 +52,9 @@ X_STATUS XTimer::SetTimer(int64_t due_time, uint32_t period_ms, uint32_t routine
+     // Any timer implementation uses absolute times eventually, convert as early
+     // as possible for increased accuracy
+     auto after = rex::chrono::hundrednanoseconds(-due_time);
+-    due_tp = std::chrono::clock_cast<WinSystemClock>(XSystemClock::now() + after);
++    due_tp = rex::chrono::clock_cast<WinSystemClock>(XSystemClock::now() + after);
+   } else {
+-    due_tp = std::chrono::clock_cast<WinSystemClock>(XSystemClock::from_file_time(due_time));
++    due_tp = rex::chrono::clock_cast<WinSystemClock>(XSystemClock::from_file_time(due_time));
+   }
+ 
+   // Stash routine for callback.
+diff --git a/src/ui/vulkan/vulkan_instance.cpp b/src/ui/vulkan/vulkan_instance.cpp
+index 22b74fe..32879e0 100644
+--- a/src/ui/vulkan/vulkan_instance.cpp
++++ b/src/ui/vulkan/vulkan_instance.cpp
+@@ -42,7 +42,16 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(const bool with_surface,
+   Functions& ifn = vulkan_instance->functions_;
+ 
+   bool functions_loaded = true;
+-  if (!vulkan_instance->loader_.Load(platform::lib_names::kVulkanLoader)) {
++  bool loader_loaded = vulkan_instance->loader_.Load(platform::lib_names::kVulkanLoader);
++#if REX_PLATFORM_MAC
++  for (const char* fallback : platform::lib_names::kVulkanLoaderFallbacks) {
++    if (loader_loaded) {
++      break;
++    }
++    loader_loaded = vulkan_instance->loader_.Load(fallback);
++  }
++#endif
++  if (!loader_loaded) {
+     REXLOG_ERROR("Failed to load {}", platform::lib_names::kVulkanLoader);
+     return nullptr;
+   }
+diff --git a/tests/smoke/CMakeLists.txt b/tests/smoke/CMakeLists.txt
+index 0e73f62..aaf7150 100644
+--- a/tests/smoke/CMakeLists.txt
++++ b/tests/smoke/CMakeLists.txt
+@@ -15,7 +15,8 @@ endif()
+ add_executable(rex_smoke smoke_app.cpp ${REX_SMOKE_MAIN})
+ target_include_directories(rex_smoke PRIVATE ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/src)
+ target_link_libraries(rex_smoke PRIVATE rexui rexcore rexkernel)
+-if(NOT WIN32)
++if(NOT WIN32 AND NOT APPLE)
++    # ld64 resolves across static archives in any order, so Apple needs no RESCAN group.
+     target_link_libraries(rex_smoke PRIVATE "$<LINK_GROUP:RESCAN,rexkernel,rexsystem>")
+ else()
+     target_link_libraries(rex_smoke PRIVATE rexsystem)
+diff --git a/tests/unit/CMakeLists.txt b/tests/unit/CMakeLists.txt
+index 79dc730..cde24be 100644
+--- a/tests/unit/CMakeLists.txt
++++ b/tests/unit/CMakeLists.txt
+@@ -35,7 +35,10 @@ set(unit_tests_link_libs
+     rexcodegen
+     rexkernel
+ )
+-if(NOT WIN32)
++if(APPLE)
++    # ld64 resolves across static archives in any order and CMake has no RESCAN for it.
++    list(APPEND unit_tests_link_libs rexsystem)
++elseif(NOT WIN32)
+     list(APPEND unit_tests_link_libs "$<LINK_GROUP:RESCAN,rexkernel,rexsystem>")
+ endif()
+ 
+diff --git a/thirdparty/CMakeLists.txt b/thirdparty/CMakeLists.txt
+index 282c16a..32716a6 100644
+--- a/thirdparty/CMakeLists.txt
++++ b/thirdparty/CMakeLists.txt
+@@ -597,6 +597,12 @@ if(REXGLUE_FFMPEG_SHARED)
+             PREFIX ""
+             OUTPUT_NAME "avutil-${FFMPEG_AVUTIL_MAJOR}"
+         )
++    elseif(APPLE)
++        # ld64 has no --version-script; export the same symbols (av*, ff_reverse) by list.
++        file(WRITE "${FFMPEG_SHARED_CONFIG_DIR}/libavutil.exp" "_av*\n_ff_reverse\n")
++        target_link_options(libavutil PRIVATE
++            "LINKER:-exported_symbols_list,${FFMPEG_SHARED_CONFIG_DIR}/libavutil.exp"
++        )
+     else()
+         target_link_options(libavutil PRIVATE
+             "LINKER:--version-script=${FFMPEG_SHARED_CONFIG_DIR}/libavutil.v"
+@@ -755,6 +761,12 @@ if(REXGLUE_FFMPEG_SHARED)
+             PREFIX ""
+             OUTPUT_NAME "avcodec-${FFMPEG_AVCODEC_MAJOR}"
+         )
++    elseif(APPLE)
++        # ld64 has no --version-script; export the same symbols (av*) by list.
++        file(WRITE "${FFMPEG_SHARED_CONFIG_DIR}/libavcodec.exp" "_av*\n")
++        target_link_options(libavcodec PRIVATE
++            "LINKER:-exported_symbols_list,${FFMPEG_SHARED_CONFIG_DIR}/libavcodec.exp"
++        )
+     else()
+         target_link_options(libavcodec PRIVATE
+             "LINKER:--version-script=${FFMPEG_DIR}/libavcodec/libavcodec.v"
+diff --git a/thirdparty/crypto/sha256.cpp b/thirdparty/crypto/sha256.cpp
+index f63fb2a..c5ef323 100644
+--- a/thirdparty/crypto/sha256.cpp
++++ b/thirdparty/crypto/sha256.cpp
+@@ -8,7 +8,9 @@
+ #include "sha256.h"
+ 
+ // big endian architectures need #define __BYTE_ORDER __BIG_ENDIAN
+-#ifndef _MSC_VER
++#if defined(__APPLE__)
++#include <machine/endian.h>
++#elif !defined(_MSC_VER)
+ #include <endian.h>
+ #endif
+ 
+diff --git a/thirdparty/disruptorplus/include/disruptorplus/multi_threaded_claim_strategy.hpp b/thirdparty/disruptorplus/include/disruptorplus/multi_threaded_claim_strategy.hpp
+index 6f2e15c..6ffa0c9 100644
+--- a/thirdparty/disruptorplus/include/disruptorplus/multi_threaded_claim_strategy.hpp
++++ b/thirdparty/disruptorplus/include/disruptorplus/multi_threaded_claim_strategy.hpp
+@@ -312,7 +312,7 @@ namespace disruptorplus
+                         return false;
+                     }
+                 }
+-                reducedCount = std::min(count, static_cast<sequence_t>(diff + 1));
++                reducedCount = static_cast<size_t>(std::min<sequence_t>(count, static_cast<sequence_t>(diff + 1)));
+             } while (!m_nextClaimable.compare_exchange_weak(
+                 sequence,
+                 static_cast<sequence_t>(sequence + reducedCount),
+diff --git a/thirdparty/renderdoc/renderdoc_app.h b/thirdparty/renderdoc/renderdoc_app.h
+index da323e9..b7e8a29 100644
+--- a/thirdparty/renderdoc/renderdoc_app.h
++++ b/thirdparty/renderdoc/renderdoc_app.h
+@@ -30,7 +30,7 @@
+ 
+ #if defined(WIN32) || defined(_WIN32)
+ 	#define RENDERDOC_CC __cdecl
+-#elif defined(__linux__)
++#elif defined(__linux__) || defined(__APPLE__) || defined(__FreeBSD__)
+ 	#define RENDERDOC_CC
+ #else
+ 	#error "Unknown platform"
+-- 
+2.54.0 (Apple Git-157)
+

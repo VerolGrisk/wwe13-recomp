@@ -85,7 +85,8 @@ These parts work on Linux ARM64 but need Apple-specific code:
 
 Code for the Apple platform, written without a Mac and checked by the **macOS port build check**
 workflow (`.github/workflows/macos-port.yml`, macOS arm64 runner, Xcode's compiler, native unit
-and PowerPC tests). It is in the ReXGlue patch series after 0103.
+and PowerPC tests). It is in the ReXGlue patch series after 0103 (0104, 0105, and 0106 with the
+fixes from the first native build).
 
 | Area | Change |
 | --- | --- |
@@ -126,9 +127,45 @@ REXGLUE_TESTS=1 PPC_BINUTILS_DIR=/path/to/ppc-binutils/bin ./tools/setup-macos.s
 F or F11 toggles fullscreen, and Esc quits. A smooth sweeping bar and visible white borders on all four
 edges mean presentation and Retina scaling are right.
 
+### First native build (patch 0106)
+
+Built on a Mac for the first time (Xcode 27.2, macOS 27, Apple A18 Pro). Patch 0106 has the compile
+and link fixes:
+
+- **Linking:** FFmpeg exports through ld64's `-exported_symbols_list` (ld64 has no `--version-script`).
+  The tests link `rexsystem` directly on Apple, because CMake has no `$<LINK_GROUP:RESCAN>` for ld64.
+- **libc++:** Apple's libc++ has no `std::move_only_function` and no `std::chrono::clock_cast`.
+  `rex::move_only_function` and `rex::chrono::clock_cast` replace them on every platform. The first is
+  the standard type where the library has it.
+- **Darwin code that 0104 missed:** the `mach_vm_region` helpers in `memory_posix.cpp` were inside
+  `#if REX_PLATFORM_LINUX`; the `*64` file functions; `getpagesize`; macOS library names (the Vulkan
+  loader is also looked for next to the executable, in an app bundle and in the Homebrew prefix);
+  the RenderDoc header; socket headers and `select`; `endian.h`; and `std::min`/`max` calls that mix
+  `size_t` and `uint64_t`, which are different types on Darwin.
+
+Results on the Mac:
+
+| Test | Result |
+| --- | --- |
+| `rex_smoke --smoke_seconds=10` | **PASS**: SDL3 window, MoltenVK on the Apple GPU, Retina 2560x1440 at about 300 fps; guest memory reserved at `0x8000000000`, MMIO read and write traps fire (SIGBUS path) |
+| `unit_tests` | 191 cases: 6 to 10 fail, depending on the run, all in guest memory (see 16 KB pages below) |
+| `ppc_tests` | Does not build (see the PowerPC assembler below) |
+
 ### Known gaps
 
-- Not yet built on a Mac: expect a first round of compile fixes from the CI job.
+- **16 KB host pages.** Apple silicon uses 16 KB pages, but the guest heaps allocate and protect
+  4 KB guest pages. `mmap`/`mprotect` on a 4 KB-aligned address that is not 16 KB-aligned fails, so
+  4 KB `BaseHeap::Alloc` and `Protect` calls fail (`heap_allocation_test.cpp`,
+  `access_violation_recovery_test.cpp`). Write-watch, MMIO and guest memory protection all work per
+  page, so the game will hit this. It needs a design decision, for example rounding host commits and
+  protections out to 16 KB and tracking 4 KB guest state separately. Linux ARM64 under qemu used
+  4 KB pages, so step 1 did not show it.
+- **PowerPC test assembler.** The instruction tests need `powerpc-none-elf-as` with the Xbox 360
+  `-mvmx128` extension. The SDK's bundled build has it, but only for x86-64 Linux and Windows. Stock
+  GNU binutils 2.42, which `PPC_BINUTILS_DIR` above and the CI job build, rejects `-mvmx128`, so
+  `ppc_tests` cannot be built on macOS yet, and the CI job's PowerPC test step will fail the same
+  way. Stock binutils 2.42 also needs `CFLAGS="-O2 -std=gnu17"` and `--with-system-zlib` with
+  Xcode 27's clang, because its bundled zlib is K&R C.
 - Freeze reports on Apple have no host backtraces, per-thread CPU time or thread state.
 - The launcher (Windows/Linux) is not ported; on macOS the game is started from Terminal for now.
 - iOS: `shm_open` is not allowed in the app sandbox, so guest memory needs Mach memory entries
