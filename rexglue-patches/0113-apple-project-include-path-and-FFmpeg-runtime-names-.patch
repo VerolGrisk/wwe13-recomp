@@ -1,0 +1,79 @@
+From b1ea7cec70f74f796538bcfd69602ae7f51a03b9 Mon Sep 17 00:00:00 2001
+From: WWE13 Recomp <wwe13-recomp@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 06:10:08 -0500
+Subject: [PATCH 113/113] apple: project include path and FFmpeg runtime names
+ for game builds
+
+- rexglue init template: on Apple, search the project root for "quoted"
+  includes only (-iquote). Apple file systems are case-insensitive, so a
+  project-root VERSION file shadowed the standard <version> header and
+  broke most of the game's own sources.
+- rexglue_helpers: copy libavcodec/libavutil beside the executable under
+  their install names (libavcodec.58.dylib), which the executable loads
+  through @rpath, as on Linux; the fully versioned file name is never
+  looked up, so the game could not start.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ cmake/rexglue_helpers.cmake                 |  6 ++++--
+ resources/templates/init/rexglue_cmake.inja | 23 ++++++++++++++++-----
+ 2 files changed, 22 insertions(+), 7 deletions(-)
+
+diff --git a/cmake/rexglue_helpers.cmake b/cmake/rexglue_helpers.cmake
+index bebee84..574d827 100644
+--- a/cmake/rexglue_helpers.cmake
++++ b/cmake/rexglue_helpers.cmake
+@@ -117,12 +117,14 @@ function(rexglue_configure_target target_name)
+                     BUILD_WITH_INSTALL_RPATH TRUE
+                     INSTALL_RPATH "@executable_path;@executable_path/../Frameworks"
+                 )
++                # Copy under the install name the executable loads (@rpath/libavcodec.58.dylib),
++                # as on Linux; the fully versioned file name is never looked up.
+                 add_custom_command(TARGET ${target_name} POST_BUILD
+                     COMMAND ${CMAKE_COMMAND} -E copy_if_different
+-                        "$<TARGET_FILE:rex::libavcodec>"
++                        "$<TARGET_SONAME_FILE:rex::libavcodec>"
+                         "$<TARGET_FILE_DIR:${target_name}>"
+                     COMMAND ${CMAKE_COMMAND} -E copy_if_different
+-                        "$<TARGET_FILE:rex::libavutil>"
++                        "$<TARGET_SONAME_FILE:rex::libavutil>"
+                         "$<TARGET_FILE_DIR:${target_name}>"
+                     VERBATIM
+                 )
+diff --git a/resources/templates/init/rexglue_cmake.inja b/resources/templates/init/rexglue_cmake.inja
+index 3f270e9..ae933be 100644
+--- a/resources/templates/init/rexglue_cmake.inja
++++ b/resources/templates/init/rexglue_cmake.inja
+@@ -34,11 +34,24 @@ endif()
+ # Usage: rexglue_setup_target(<target>)
+ macro(rexglue_setup_target target_name)
+     target_sources({{ cmake_var("target_name") }} PRIVATE {{ cmake_var("GENERATED_SOURCES") }})
+-    target_include_directories({{ cmake_var("target_name") }} PRIVATE
+-        {{ cmake_var("CMAKE_CURRENT_SOURCE_DIR") }}
+-        {{ cmake_var("CMAKE_CURRENT_SOURCE_DIR") }}/src
+-        {{ cmake_var("CMAKE_CURRENT_SOURCE_DIR") }}/generated
+-    )
++    if(APPLE)
++        # Apple file systems are case-insensitive by default, so a project-root file such as
++        # VERSION would shadow the standard <version> header. Search the project root for
++        # "quoted" includes only (-iquote never applies to <angled> ones).
++        target_include_directories({{ cmake_var("target_name") }} PRIVATE
++            {{ cmake_var("CMAKE_CURRENT_SOURCE_DIR") }}/src
++            {{ cmake_var("CMAKE_CURRENT_SOURCE_DIR") }}/generated
++        )
++        target_compile_options({{ cmake_var("target_name") }} PRIVATE
++            "SHELL:-iquote {{ cmake_var("CMAKE_CURRENT_SOURCE_DIR") }}"
++        )
++    else()
++        target_include_directories({{ cmake_var("target_name") }} PRIVATE
++            {{ cmake_var("CMAKE_CURRENT_SOURCE_DIR") }}
++            {{ cmake_var("CMAKE_CURRENT_SOURCE_DIR") }}/src
++            {{ cmake_var("CMAKE_CURRENT_SOURCE_DIR") }}/generated
++        )
++    endif()
+     target_link_libraries({{ cmake_var("target_name") }} PRIVATE
+         rex::core
+         rex::system
+-- 
+2.54.0 (Apple Git-157)
+

@@ -1,0 +1,88 @@
+From 4ac9b0f17dbf5d13eebf59292cf5b045b02fd5d6 Mon Sep 17 00:00:00 2001
+From: WWE13 Recomp <wwe13-recomp@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 06:10:08 -0500
+Subject: [PATCH 112/113] vulkan: remember failed pipelines; dump_shaders for
+ the Vulkan backend
+
+A pipeline whose synchronous creation failed was erased from the cache,
+so every draw that needed it recompiled it and logged four lines again
+(thousands per minute). Failed descriptions are now remembered and those
+draws skipped.
+
+dump_shaders now also writes the translated SPIR-V from the Vulkan
+backend (it only did for D3D12), which is how the MoltenVK shader bugs
+were found.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ include/rex/graphics/vulkan/pipeline_cache.h |  4 ++++
+ src/graphics/vulkan/pipeline_cache.cpp       | 10 ++++++++++
+ 2 files changed, 14 insertions(+)
+
+diff --git a/include/rex/graphics/vulkan/pipeline_cache.h b/include/rex/graphics/vulkan/pipeline_cache.h
+index 1e1cbf1..52a8369 100644
+--- a/include/rex/graphics/vulkan/pipeline_cache.h
++++ b/include/rex/graphics/vulkan/pipeline_cache.h
+@@ -24,6 +24,7 @@
+ #include <set>
+ #include <thread>
+ #include <unordered_map>
++#include <unordered_set>
+ #include <utility>
+ #include <vector>
+ 
+@@ -423,6 +424,9 @@ class VulkanPipelineCache {
+   VkShaderModule depth_float24_round_fragment_shader_ = VK_NULL_HANDLE;
+ 
+   std::unordered_map<PipelineDescription, Pipeline, PipelineDescription::Hasher> pipelines_;
++  // Descriptions whose synchronous creation failed (for example a shader the driver rejects), so
++  // the draws that need them are skipped instead of recompiling and logging on every draw.
++  std::unordered_set<PipelineDescription, PipelineDescription::Hasher> failed_pipelines_;
+ 
+   // Previously used pipeline, to avoid lookups if the state wasn't changed.
+   const std::pair<const PipelineDescription, Pipeline>* last_pipeline_ = nullptr;
+diff --git a/src/graphics/vulkan/pipeline_cache.cpp b/src/graphics/vulkan/pipeline_cache.cpp
+index e2fdd64..de78676 100644
+--- a/src/graphics/vulkan/pipeline_cache.cpp
++++ b/src/graphics/vulkan/pipeline_cache.cpp
+@@ -860,6 +860,7 @@ void VulkanPipelineCache::Shutdown() {
+     }
+   }
+   pipelines_.clear();
++  failed_pipelines_.clear();
+ 
+   // Destroy all internal shaders.
+   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyShaderModule, device,
+@@ -1154,6 +1155,9 @@ bool VulkanPipelineCache::ConfigurePipeline(
+         bound_rts, shader_writes_color_targets, shader_writes_depth);
+   }
+ 
++  if (failed_pipelines_.count(description)) {
++    return false;
++  }
+   auto it = pipelines_.find(description);
+   if (it != pipelines_.end()) {
+     VkPipeline found_pipeline = it->second.pipeline.load(std::memory_order_acquire);
+@@ -1207,6 +1211,8 @@ bool VulkanPipelineCache::ConfigurePipeline(
+ 
+   if (!queued_async_creation && !EnsurePipelineCreated(creation_arguments_real)) {
+     pipelines_.erase(description);
++    // Remember the failure (logged once by EnsurePipelineCreated) so it is not retried per draw.
++    failed_pipelines_.insert(description);
+     return false;
+   }
+   if (!queued_async_creation) {
+@@ -1271,6 +1277,10 @@ bool VulkanPipelineCache::TranslateAnalyzedShader(SpirvShaderTranslator& transla
+     REXGPU_ERROR("Shader {:016X} translation failed; marking as ignored", shader.ucode_data_hash());
+     return false;
+   }
++  // Dump the translated SPIR-V if desired (as the D3D12 backend does).
++  if (!REXCVAR_GET(dump_shaders).empty()) {
++    translation.Dump(REXCVAR_GET(dump_shaders), "vk");
++  }
+   if (translation.GetOrCreateShaderModule() == VK_NULL_HANDLE) {
+     return false;
+   }
+-- 
+2.54.0 (Apple Git-157)
+

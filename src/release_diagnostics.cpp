@@ -665,7 +665,8 @@ std::uintptr_t HostProgramCounter(void* signal_context) {
   }
 #if defined(__APPLE__) && defined(__aarch64__)
   const auto* context = static_cast<const ucontext_t*>(signal_context);
-  return reinterpret_cast<std::uintptr_t>(arm_thread_state64_get_pc(context->uc_mcontext->__ss));
+  // arm_thread_state64_get_pc returns an integer (__uint64_t), not a pointer.
+  return static_cast<std::uintptr_t>(arm_thread_state64_get_pc(context->uc_mcontext->__ss));
 #elif defined(__x86_64__) && defined(REG_RIP)
   const auto* context = static_cast<const ucontext_t*>(signal_context);
   return static_cast<std::uintptr_t>(context->uc_mcontext.gregs[REG_RIP]);
@@ -986,7 +987,11 @@ void StartTestCrashIfRequested() {
   }
   REXLOG_WARN("[wwe13-test-crash] armed; deliberate access violation in 8 seconds");
   std::thread([] {
+#if defined(__APPLE__)
+    pthread_setname_np("wwe13-test-crash");  // Darwin: names the calling thread only
+#else
     pthread_setname_np(pthread_self(), "wwe13-test-crash");
+#endif
     std::this_thread::sleep_for(kTestCrashDelay);
     volatile std::uintptr_t invalid_address = 1;
     *reinterpret_cast<volatile std::uint32_t*>(invalid_address) = 0x13;

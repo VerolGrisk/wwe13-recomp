@@ -1,0 +1,93 @@
+From 28d1ec83d87263d176f3c9588ea7937d4a8dc16a Mon Sep 17 00:00:00 2001
+From: WWE13 Recomp <wwe13-recomp@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 06:10:08 -0500
+Subject: [PATCH 110/113] memory: 0xE0000000 host offset on Apple silicon,
+ checked at startup
+
+The 0xE0000000 physical heap gets a 0x1000 host_address_offset whenever
+the host allocation granularity exceeds 4 KB (PhysicalHeap::Initialize):
+Windows (64 KB) and Apple silicon (16 KB). Recompiled code adds the same
+offset at compile time (PPC_PHYS_HOST_OFFSET, detail::PhysicalHostOffset),
+but only on Windows. On Apple silicon guest code and the kernel saw that
+heap 4 KB apart, so kernel objects there were corrupted: WWE '13 deadlocked
+at startup on a critical section at 0xFFCAB000 that had a lock count but
+no owner (black screen).
+
+The compile-time offset is now on for Apple arm64 too (Intel Macs have
+4 KB pages, like Linux), and PhysicalHeap::Initialize aborts with a clear
+error if the runtime offset and REX_PHYS_HEAP_HOST_OFFSET ever disagree.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ include/rex/ppc/function.h |  2 +-
+ include/rex/ppc/memory.h   |  7 ++++++-
+ src/system/xmemory.cpp     | 13 +++++++++++++
+ 3 files changed, 20 insertions(+), 2 deletions(-)
+
+diff --git a/include/rex/ppc/function.h b/include/rex/ppc/function.h
+index 83ab653..71076bd 100644
+--- a/include/rex/ppc/function.h
++++ b/include/rex/ppc/function.h
+@@ -148,7 +148,7 @@ struct arg_count_t {
+ 
+ namespace detail {
+ constexpr uint32_t PhysicalHostOffset([[maybe_unused]] uint32_t guest_addr) noexcept {
+-#if REX_PLATFORM_WIN32
++#if REX_PLATFORM_WIN32 || (REX_PLATFORM_MAC && defined(__aarch64__))  // see rex/ppc/memory.h
+   return (guest_addr >= 0xE0000000u) ? 0x1000u : 0u;
+ #else
+   return 0u;  // Linux has 4KB granularity, file offset works directly
+diff --git a/include/rex/ppc/memory.h b/include/rex/ppc/memory.h
+index c5cc900..029d879 100644
+--- a/include/rex/ppc/memory.h
++++ b/include/rex/ppc/memory.h
+@@ -42,9 +42,14 @@
+ // everywhere and adding it to every single memory access.
+ // Maybe a separate base pointer for the 0xE0 heap?
+ //=============================================================================
+-#if REX_PLATFORM_WIN32
++// Apple silicon has 16 KB pages, so it takes the same path as Windows (the kernel heap's
++// host_address_offset is 0x1000 whenever allocation granularity exceeds 4 KB; Memory checks at
++// startup that the two agree). Intel Macs have 4 KB pages, like Linux.
++#if REX_PLATFORM_WIN32 || (REX_PLATFORM_MAC && defined(__aarch64__))
++#define REX_PHYS_HEAP_HOST_OFFSET 1
+ #define PPC_PHYS_HOST_OFFSET(addr) (((uint32_t)(addr) >= 0xE0000000u) ? 0x1000u : 0u)
+ #else
++#define REX_PHYS_HEAP_HOST_OFFSET 0
+ #define PPC_PHYS_HOST_OFFSET(addr) 0u  // Linux has 4KB granularity, file offset works
+ #endif
+ 
+diff --git a/src/system/xmemory.cpp b/src/system/xmemory.cpp
+index 24e24c6..da1b0d3 100644
+--- a/src/system/xmemory.cpp
++++ b/src/system/xmemory.cpp
+@@ -30,6 +30,7 @@
+ #include <rex/stream.h>
+ #include <rex/system/mmio_handler.h>
+ #include <rex/system/thread_state.h>
++#include <rex/ppc/memory.h>  // REX_PHYS_HEAP_HOST_OFFSET
+ #include <rex/system/xmemory.h>
+ #include <rex/thread.h>
+ 
+@@ -2201,6 +2202,18 @@ void PhysicalHeap::Initialize(memory::Memory* memory, uint8_t* membase, HeapType
+   } else {
+     host_address_offset = 0;
+   }
++  // Recompiled code adds the same offset at compile time (PPC_PHYS_HOST_OFFSET in
++  // rex/ppc/memory.h). If the two disagree, guest code and the kernel see the 0xE0000000 heap
++  // 4 KB apart, which silently corrupts kernel objects there (critical sections deadlock).
++  if (heap_base >= 0xE0000000 &&
++      host_address_offset != (REX_PHYS_HEAP_HOST_OFFSET ? 0x1000u : 0u)) {
++    REXSYS_ERROR(
++        "PhysicalHeap: host allocation granularity {:#x} needs a 0xE0000000 host offset of {:#x}, "
++        "but this build's recompiled code uses {:#x} (REX_PHYS_HEAP_HOST_OFFSET); refusing to run",
++        rex::memory::allocation_granularity(), host_address_offset,
++        REX_PHYS_HEAP_HOST_OFFSET ? 0x1000u : 0u);
++    std::abort();
++  }
+ 
+   BaseHeap::Initialize(memory, membase, heap_type, heap_base, heap_size, page_size,
+                        host_address_offset);
+-- 
+2.54.0 (Apple Git-157)
+

@@ -86,7 +86,8 @@ These parts work on Linux ARM64 but need Apple-specific code:
 Code for the Apple platform, written without a Mac and checked by the **macOS port build check**
 workflow (`.github/workflows/macos-port.yml`, macOS arm64 runner, Xcode's compiler, native unit
 and PowerPC tests). It is in the ReXGlue patch series after 0103 (0104, 0105, 0106 with the
-fixes from the first native build, 0107 for 16 KB host pages, and 0108 for function aliases).
+fixes from the first native build, 0107 for 16 KB host pages, 0108 for function aliases, and
+0109–0113 from the first game boot).
 
 | Area | Change |
 | --- | --- |
@@ -207,6 +208,35 @@ the plain functions are already 64-bit. The launcher finds its own folder throug
 **Play** runs a `wwe13` executable next to the launcher. That path is untested on macOS, because
 it needs a game build, and `tools/build-macos.sh` writes the game to
 `out/build/macos-arm64-relwithdebinfo/RelWithDebInfo/`, so for now copy it next to the launcher.
+
+### First game boot (patches 0109–0113)
+
+Codegen and the game build work on the Mac (72,827 functions; codegen takes about 40 s). The game
+boots to its first loading screen with correct colours and plays music. To get there:
+
+| Problem | Fix |
+| --- | --- |
+| `timer_queue.cpp` does not compile with Xcode 16 (libc++ 19 hides `std::jthread`) | 0109: `std::thread` plus a stop flag |
+| Most game sources fail: `#include <version>` finds the repository's `VERSION` file (case-insensitive file system) | 0113: on Apple the project root is searched with `-iquote` only |
+| The game cannot load FFmpeg: the dylibs were copied under their full version names, not the `@rpath` install names | 0113: copy under the install names, as on Linux |
+| Crash handler: Darwin's PC is an integer, and `pthread_setname_np` takes only a name | `src/release_diagnostics.cpp` |
+| Vulkan device rejected: Apple GPUs have no geometry shaders | run with `--vulkan_require_geometry_shader=false` (the SDK's fallback paths) |
+| **Black screen: startup deadlock** on a critical section with a lock count but no owner | 0110: recompiled code did not add the 0x1000 host offset for the 0xE0000000 heap on Apple silicon, so guest code and the kernel saw that heap 4 KB apart. Now on for Apple arm64, with a startup check that both sides agree |
+| Purple screen: the rectangle-list fallback vertex shader was invalid SPIR-V and used a `gl_PerVertex` local that SPIRV-Cross cannot declare in MSL | 0111. All 13 shaders seen convert and compile with the Metal compiler |
+| A failed pipeline was recompiled and logged on every draw | 0112: failed pipelines are remembered; `--dump_shaders` now works for Vulkan |
+
+Running it (from the build folder; the launcher passes the same options):
+
+```bash
+./wwe13 "/path/to/WWE 13" --vulkan_require_geometry_shader=false --fullscreen=false \
+  --ignore_offset_for_ranged_allocations=true --mnk_mode=true --user_data_root=$PWD/userdata
+```
+
+**Open: stuck on the first loading screen.** The screen animates (about 50 frames/s) and music plays,
+but loading never finishes. Wwise keeps retrying two sound banks, `Weapons_M` (2.1 MB) and `WSD`
+(5.8 MB), while `Weapons` (105 KB) from the same `Game.pck` loads. Ruled out so far: missing data (all
+banks are in the packages), file reads (synchronous, no errors), locks, GPU errors, and memory (the
+failed physical allocations are the game's normal probing, see patch 0038).
 
 ### Known gaps
 

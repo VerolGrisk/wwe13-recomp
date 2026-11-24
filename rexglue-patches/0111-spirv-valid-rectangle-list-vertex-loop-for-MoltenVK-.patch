@@ -1,0 +1,123 @@
+From 3f91307f7df5bcccf8c10b66d98e7cabecfc7a8c Mon Sep 17 00:00:00 2001
+From: WWE13 Recomp <wwe13-recomp@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 06:10:08 -0500
+Subject: [PATCH 111/113] spirv: valid rectangle-list vertex loop for MoltenVK
+ (no geometry shaders)
+
+Without geometry shaders, rectangle lists are expanded in the vertex
+shader by looping over the 3 guest vertices. Two bugs made that shader
+unusable on MoltenVK:
+
+- The "not last guest vertex" branch ends with a branch to the loop
+  continue block, then IfBuilder::makeBeginElse() added a second branch
+  to the merge block (spirv-val: "Branch must appear in a block";
+  SPIRV-Cross: "Trying to end a non-existing block"). Use
+  makeBeginElse(false).
+- The per-guest-vertex storage was a Function array of the built-in
+  gl_PerVertex block type, which SPIRV-Cross's MSL output never declares
+  ("use of undeclared identifier _RESERVED_IDENTIFIER_FIXUP_gl_PerVertex").
+  It now uses an undecorated twin struct, copied member by member.
+
+On Apple silicon WWE '13's title/loading screen draws its rectangle lists
+again; all 13 shaders it uses convert with SPIRV-Cross and compile with
+the Metal compiler.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../pipeline/shader/spirv_translator.h        |  4 +++
+ .../pipeline/shader/spirv_translator.cpp      | 36 ++++++++++++++-----
+ 2 files changed, 31 insertions(+), 9 deletions(-)
+
+diff --git a/include/rex/graphics/pipeline/shader/spirv_translator.h b/include/rex/graphics/pipeline/shader/spirv_translator.h
+index df99bfd..879445e 100644
+--- a/include/rex/graphics/pipeline/shader/spirv_translator.h
++++ b/include/rex/graphics/pipeline/shader/spirv_translator.h
+@@ -946,6 +946,10 @@ class SpirvShaderTranslator : public ShaderTranslator {
+   uint32_t output_per_vertex_member_clip_distance_;
+   uint32_t output_per_vertex_member_cull_distance_;
+   spv::Id type_output_per_vertex_;
++  // Same members as type_output_per_vertex_ without the Block / BuiltIn decorations, for the
++  // rectangle-list loop's per-guest-vertex storage. A Function variable of the built-in
++  // gl_PerVertex type has no struct declaration in SPIRV-Cross's MSL output (MoltenVK).
++  spv::Id type_rectangle_per_vertex_;
+   spv::Id output_per_vertex_;
+ 
+   // With fragment shader interlock, variables in the main function.
+diff --git a/src/graphics/pipeline/shader/spirv_translator.cpp b/src/graphics/pipeline/shader/spirv_translator.cpp
+index 223b7c9..4c79d47 100644
+--- a/src/graphics/pipeline/shader/spirv_translator.cpp
++++ b/src/graphics/pipeline/shader/spirv_translator.cpp
+@@ -129,6 +129,7 @@ void SpirvShaderTranslator::Reset() {
+   output_per_vertex_member_clip_distance_ = UINT32_MAX;
+   output_per_vertex_member_cull_distance_ = UINT32_MAX;
+   type_output_per_vertex_ = spv::NoResult;
++  type_rectangle_per_vertex_ = spv::NoResult;
+   output_per_vertex_ = spv::NoResult;
+   output_fragment_depth_ = spv::NoResult;
+   output_fragment_sample_mask_ = spv::NoResult;
+@@ -516,7 +517,7 @@ void SpirvShaderTranslator::StartTranslation() {
+           builder_->createVariable(spv::NoPrecision, spv::StorageClassFunction, type_uint_,
+                                    "xe_var_rectangle_guest_vertex_index", const_uint_0_);
+       spv::Id type_rectangle_per_vertex_array =
+-          builder_->makeArrayType(type_output_per_vertex_, builder_->makeUintConstant(3), 0);
++          builder_->makeArrayType(type_rectangle_per_vertex_, builder_->makeUintConstant(3), 0);
+       var_main_rectangle_per_vertex_ =
+           builder_->createVariable(spv::NoPrecision, spv::StorageClassFunction,
+                                    type_rectangle_per_vertex_array, "xe_var_rectangle_per_vertex");
+@@ -694,13 +695,23 @@ std::vector<uint8_t> SpirvShaderTranslator::CompleteTranslation() {
+       spv::Id rectangle_guest_vertex_index_int =
+           builder_->createUnaryOp(spv::OpBitcast, type_int_, rectangle_guest_vertex_index);
+ 
+-      // Store current iteration outputs.
+-      id_vector_temp_.clear();
+-      id_vector_temp_.push_back(rectangle_guest_vertex_index_int);
+-      builder_->createStore(
+-          builder_->createLoad(output_per_vertex_, spv::NoPrecision),
+-          builder_->createAccessChain(spv::StorageClassFunction, var_main_rectangle_per_vertex_,
+-                                      id_vector_temp_));
++      // Store current iteration outputs, member by member (the storage struct is a plain twin
++      // of gl_PerVertex, so a whole-struct store would mismatch types).
++      for (uint32_t member = 0; member < output_per_vertex_member_count_; ++member) {
++        id_vector_temp_.clear();
++        id_vector_temp_.push_back(builder_->makeIntConstant(int(member)));
++        spv::Id member_value = builder_->createLoad(
++            builder_->createAccessChain(spv::StorageClassOutput, output_per_vertex_,
++                                        id_vector_temp_),
++            spv::NoPrecision);
++        id_vector_temp_.clear();
++        id_vector_temp_.push_back(rectangle_guest_vertex_index_int);
++        id_vector_temp_.push_back(builder_->makeIntConstant(int(member)));
++        builder_->createStore(member_value,
++                              builder_->createAccessChain(spv::StorageClassFunction,
++                                                          var_main_rectangle_per_vertex_,
++                                                          id_vector_temp_));
++      }
+       uint32_t interpolators_remaining = GetModificationInterpolatorMask();
+       uint32_t interpolator_index;
+       while (rex::bit_scan_forward(interpolators_remaining, &interpolator_index)) {
+@@ -885,7 +896,10 @@ std::vector<uint8_t> SpirvShaderTranslator::CompleteTranslation() {
+         }
+         builder_->createBranch(main_loop_continue_);
+       }
+-      if_not_last_guest_vertex.makeBeginElse();
++      // The "then" side already ended with the branch to the loop continue block above, so it
++      // must not also branch to the merge block: a second terminator is invalid SPIR-V ("Branch
++      // must appear in a block"). Desktop drivers tolerate it, SPIRV-Cross (MoltenVK) does not.
++      if_not_last_guest_vertex.makeBeginElse(false);
+       {
+         spv::Id rectangle_host_vertex_in_primitive = builder_->createBinOp(
+             spv::OpBitwiseAnd, type_uint_,
+@@ -1715,6 +1729,10 @@ void SpirvShaderTranslator::StartVertexOrTessEvalShaderBeforeMain() {
+   }
+   builder_->addDecoration(type_struct_per_vertex, spv::DecorationBlock);
+   type_output_per_vertex_ = type_struct_per_vertex;
++  if (IsSpirvRectangleListVertexLoopEnabled()) {
++    type_rectangle_per_vertex_ =
++        builder_->makeStructType(struct_per_vertex_members, "XeRectanglePerVertex");
++  }
+   output_per_vertex_ = builder_->createVariable(spv::NoPrecision, spv::StorageClassOutput,
+                                                 type_struct_per_vertex, "");
+   builder_->addDecoration(output_per_vertex_, spv::DecorationInvariant);
+-- 
+2.54.0 (Apple Git-157)
+
