@@ -1,0 +1,712 @@
+From e26384004a09323b62a33f6fc89e343b44bb7293 Mon Sep 17 00:00:00 2001
+From: WWE13 Recomp <wwe13-recomp@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 18:57:00 +0000
+Subject: [PATCH] ios: iOS / iPadOS build of the SDK and rex_smoke as an app
+
+- CMake: on iOS skip the host tools (codegen, rexglue CLI) and the unit /
+  instruction tests, link FFmpeg statically, install list without them.
+- Guest memory: REXGLUE_APPLE_MACH_MEMORY (default ON for iOS, optional on
+  macOS) backs the guest page file with a named Mach memory entry
+  (mach_make_memory_entry_64) and vm_maps its views, since iOS denies
+  shm_open; region queries use vm_region_64 on iOS (no mach_vm.h).
+- Vulkan: on iOS the loader is the embedded MoltenVK.framework.
+- rex_smoke: iOS app bundle (cmake/ios/Info.plist.in, app.entitlements with
+  extended virtual addressing and increased memory limit), embeds
+  REXGLUE_IOS_MOLTENVK_FRAMEWORK; reports address-space range
+  (task_vm_info), memory available to the app (os_proc_available_memory)
+  and a fiber round trip.
+- SDL context: no painting while the app is in the background (iOS).
+---
+ CMakeLists.txt                            |  12 ++-
+ cmake/ios/Info.plist.in                   |  82 ++++++++++++++++
+ cmake/ios/app.entitlements                |  16 ++++
+ cmake/rexglue_install.cmake               |  15 ++-
+ include/rex/platform/dynlib.h             |  12 +++
+ include/rex/ui/windowed_app_context_sdl.h |   5 +
+ src/core/CMakeLists.txt                   |  12 +++
+ src/core/memory_posix.cpp                 | 111 ++++++++++++++++++++--
+ src/ui/windowed_app_context_sdl.cpp       |  29 ++++++
+ tests/CMakeLists.txt                      |   7 ++
+ tests/smoke/CMakeLists.txt                |  27 ++++++
+ tests/smoke/smoke_app.cpp                 |  91 +++++++++++++++++-
+ 12 files changed, 406 insertions(+), 13 deletions(-)
+ create mode 100644 cmake/ios/Info.plist.in
+ create mode 100644 cmake/ios/app.entitlements
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index ca90223..33e916b 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -18,6 +18,10 @@ option(REXGLUE_ENABLE_TRACY                "Enable Tracy profiler integration" O
+ option(REXGLUE_ENABLE_PERF_COUNTERS        "Enable lightweight perf counter registry and overlay" OFF)
+ option(REXGLUE_PROFILE_GUEST_FUNCTIONS     "Enable per-function Tracy zones in recompiled guest code (high overhead)" OFF)
+ option(REXGLUE_FFMPEG_SHARED "Build FFmpeg libavutil/libavcodec as shared libraries" ON)
++if(CMAKE_SYSTEM_NAME STREQUAL "iOS" AND REXGLUE_FFMPEG_SHARED)
++    # iOS apps can only load dylibs embedded and signed in the bundle; link FFmpeg statically there.
++    set(REXGLUE_FFMPEG_SHARED OFF CACHE BOOL "Build FFmpeg libavutil/libavcodec as shared libraries" FORCE)
++endif()
+ 
+ # Propagate profiling defines globally (compiled out in Release)
+ if(REXGLUE_ENABLE_TRACY)
+@@ -229,8 +233,12 @@ add_subdirectory(src/audio)
+ add_subdirectory(src/graphics)
+ add_subdirectory(src/system)
+ add_subdirectory(src/kernel)
+-add_subdirectory(src/codegen)
+-add_subdirectory(src/rexglue)
++if(NOT REX_PLATFORM_IOS_BUILD)
++    # Host tools (code generator and the rexglue CLI): they run on the build machine, never on iOS.
++    # An iOS build of a game uses the codegen output from a macOS build of the SDK.
++    add_subdirectory(src/codegen)
++    add_subdirectory(src/rexglue)
++endif()
+ 
+ # Add tests subdirectory if tests are enabled
+ if(REXGLUE_BUILD_TESTS)
+diff --git a/cmake/ios/Info.plist.in b/cmake/ios/Info.plist.in
+new file mode 100644
+index 0000000..091b476
+--- /dev/null
++++ b/cmake/ios/Info.plist.in
+@@ -0,0 +1,82 @@
++<?xml version="1.0" encoding="UTF-8"?>
++<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
++<!-- ReXGlue iOS app Info.plist template (CMake MACOSX_BUNDLE_INFO_PLIST). -->
++<plist version="1.0">
++<dict>
++  <key>CFBundleDevelopmentRegion</key>
++  <string>en</string>
++  <key>CFBundleExecutable</key>
++  <string>${MACOSX_BUNDLE_EXECUTABLE_NAME}</string>
++  <key>CFBundleIdentifier</key>
++  <string>${MACOSX_BUNDLE_GUI_IDENTIFIER}</string>
++  <key>CFBundleInfoDictionaryVersion</key>
++  <string>6.0</string>
++  <key>CFBundleName</key>
++  <string>${MACOSX_BUNDLE_BUNDLE_NAME}</string>
++  <key>CFBundleDisplayName</key>
++  <string>${MACOSX_BUNDLE_BUNDLE_NAME}</string>
++  <key>CFBundlePackageType</key>
++  <string>APPL</string>
++  <key>CFBundleShortVersionString</key>
++  <string>${MACOSX_BUNDLE_SHORT_VERSION_STRING}</string>
++  <key>CFBundleVersion</key>
++  <string>${MACOSX_BUNDLE_BUNDLE_VERSION}</string>
++  <key>CFBundleSupportedPlatforms</key>
++  <array>
++    <string>iPhoneOS</string>
++  </array>
++  <key>MinimumOSVersion</key>
++  <string>17.0</string>
++  <key>LSRequiresIPhoneOS</key>
++  <true/>
++  <key>UIDeviceFamily</key>
++  <array>
++    <integer>1</integer>
++    <integer>2</integer>
++  </array>
++  <key>UIRequiredDeviceCapabilities</key>
++  <array>
++    <string>arm64</string>
++    <string>metal</string>
++  </array>
++  <!-- Full screen, landscape, no status bar: a game. -->
++  <key>UIRequiresFullScreen</key>
++  <true/>
++  <key>UIStatusBarHidden</key>
++  <true/>
++  <key>UIViewControllerBasedStatusBarAppearance</key>
++  <false/>
++  <key>UISupportedInterfaceOrientations</key>
++  <array>
++    <string>UIInterfaceOrientationLandscapeLeft</string>
++    <string>UIInterfaceOrientationLandscapeRight</string>
++  </array>
++  <key>UISupportedInterfaceOrientations~ipad</key>
++  <array>
++    <string>UIInterfaceOrientationLandscapeLeft</string>
++    <string>UIInterfaceOrientationLandscapeRight</string>
++  </array>
++  <key>UILaunchScreen</key>
++  <dict>
++    <key>UIColorName</key>
++    <string></string>
++  </dict>
++  <!-- The app's Documents folder shows in the Files app and in Finder (game files, logs). -->
++  <key>UIFileSharingEnabled</key>
++  <true/>
++  <key>LSSupportsOpeningDocumentsInPlace</key>
++  <true/>
++  <!-- Mouse, trackpad and keyboard on iPad; game controllers. -->
++  <key>UIApplicationSupportsIndirectInputEvents</key>
++  <true/>
++  <key>GCSupportsControllerUserInteraction</key>
++  <true/>
++  <key>GCSupportedGameControllers</key>
++  <array>
++    <dict>
++      <key>ProfileName</key>
++      <string>ExtendedGamepad</string>
++    </dict>
++  </array>
++</dict>
++</plist>
+diff --git a/cmake/ios/app.entitlements b/cmake/ios/app.entitlements
+new file mode 100644
+index 0000000..a3f35ec
+--- /dev/null
++++ b/cmake/ios/app.entitlements
+@@ -0,0 +1,16 @@
++<?xml version="1.0" encoding="UTF-8"?>
++<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
++<!--
++  Entitlements a ReXGlue game needs on iOS. The guest address space alone is a ~4.5 GB contiguous
++  reservation, so the app asks for the extended virtual address space and the raised memory limit.
++  A signing service may drop entitlements its certificate does not allow; the smoke test reports
++  what the app actually got.
++-->
++<plist version="1.0">
++<dict>
++  <key>com.apple.developer.kernel.extended-virtual-addressing</key>
++  <true/>
++  <key>com.apple.developer.kernel.increased-memory-limit</key>
++  <true/>
++</dict>
++</plist>
+diff --git a/cmake/rexglue_install.cmake b/cmake/rexglue_install.cmake
+index 0679e70..d68629a 100644
+--- a/cmake/rexglue_install.cmake
++++ b/cmake/rexglue_install.cmake
+@@ -9,21 +9,28 @@ set_target_properties(rexaudio PROPERTIES EXPORT_NAME audio)
+ set_target_properties(rexgraphics PROPERTIES EXPORT_NAME graphics)
+ set_target_properties(rexsystem PROPERTIES EXPORT_NAME system)
+ set_target_properties(rexkernel PROPERTIES EXPORT_NAME kernel)
+-set_target_properties(rexcodegen PROPERTIES EXPORT_NAME codegen)
++if(TARGET rexcodegen)
++    set_target_properties(rexcodegen PROPERTIES EXPORT_NAME codegen)
++endif()
+ 
+ # Build install target list dynamically based on backend options
+ set(REXGLUE_INSTALL_TARGETS
+     # ReX SDK libraries
+     rexcore rexfilesystem rexui rexinput
+-    rexaudio rexgraphics rexsystem rexkernel rexcodegen
++    rexaudio rexgraphics rexsystem rexkernel
+     # Vendored thirdparty libraries (required by SDK)
+     disruptorplus renderdoc simde tomlplusplus  # INTERFACE (header-only)
+     aes128 mspack o1heap disasm xxhash imgui  # STATIC libraries
+     rexdecoders                  # single-file audio decoders (custom music)
+     libavcodec libavutil           # FFmpeg (vendored build)
+-    # CLI tool
+-    rexglue
+ )
++# Code generator library and CLI tool: host-only, not built for iOS.
++if(TARGET rexcodegen)
++    list(APPEND REXGLUE_INSTALL_TARGETS rexcodegen)
++endif()
++if(TARGET rexglue)
++    list(APPEND REXGLUE_INSTALL_TARGETS rexglue)
++endif()
+ 
+ if(REXGLUE_USE_VULKAN)
+     list(APPEND REXGLUE_INSTALL_TARGETS
+diff --git a/include/rex/platform/dynlib.h b/include/rex/platform/dynlib.h
+index f3b3c6e..e8c9cf7 100644
+--- a/include/rex/platform/dynlib.h
++++ b/include/rex/platform/dynlib.h
+@@ -56,6 +56,18 @@ inline constexpr const char* kVulkanLoader = "libvulkan.so.1";
+ inline constexpr const char* kRenderDoc = "librenderdoc.so";
+ inline constexpr const char* kSpirvToolsSdkPath = "bin/libSPIRV-Tools-shared.so";
+ 
++#elif REX_PLATFORM_MAC && defined(TARGET_OS_IOS) && TARGET_OS_IOS
++
++// iOS has no Vulkan loader: the app bundles MoltenVK (a dynamic framework in Frameworks/), which
++// exports vkGetInstanceProcAddr itself and is loaded in the loader's place.
++inline constexpr const char* kVulkanLoader = "@executable_path/Frameworks/MoltenVK.framework/MoltenVK";
++inline constexpr const char* kVulkanLoaderFallbacks[] = {
++    "@rpath/MoltenVK.framework/MoltenVK",
++    "@executable_path/Frameworks/libMoltenVK.dylib",
++};
++inline constexpr const char* kRenderDoc = "librenderdoc.dylib";
++inline constexpr const char* kSpirvToolsSdkPath = "lib/libSPIRV-Tools-shared.dylib";
++
+ #elif REX_PLATFORM_MAC
+ 
+ // dlopen of a bare name does not search Homebrew's prefix or an app bundle, so the Vulkan
+diff --git a/include/rex/ui/windowed_app_context_sdl.h b/include/rex/ui/windowed_app_context_sdl.h
+index b8a8805..717a223 100644
+--- a/include/rex/ui/windowed_app_context_sdl.h
++++ b/include/rex/ui/windowed_app_context_sdl.h
+@@ -47,12 +47,17 @@ class SDLWindowedAppContext final : public WindowedAppContext {
+ 
+  private:
+   void DispatchEvent(const SDL_Event& event);
++  // iOS app lifecycle: an app must not submit GPU work in the background, so painting stops
++  // between "will enter background" and "did enter foreground". Runs as an SDL event watch because
++  // iOS delivers these synchronously and expects the app to react before returning.
++  static bool AppLifecycleWatch(void* userdata, SDL_Event* event);
+ 
+   bool sdl_initialized_ = false;
+   uint32_t pending_functions_event_type_ = 0;
+   uint32_t paint_event_type_ = 0;
+   std::atomic<bool> pending_functions_event_queued_{false};
+   bool quit_requested_ = false;
++  std::atomic<bool> in_background_{false};
+   std::unordered_map<uint32_t, SDLWindow*> windows_;
+   // RequestPaint is called from any thread (the presenter's guest-output thread among them), so
+   // the per-window "paint event pending" flags are guarded.
+diff --git a/src/core/CMakeLists.txt b/src/core/CMakeLists.txt
+index 94134b7..1461182 100644
+--- a/src/core/CMakeLists.txt
++++ b/src/core/CMakeLists.txt
+@@ -84,6 +84,18 @@ if(UNIX)
+         # PUBLIC so every ReXGlue library and the game see the same <ucontext.h> layout; third-party
+         # code (SDL's Cocoa backend, FFmpeg) is not affected.
+         target_compile_definitions(rexcore PUBLIC _XOPEN_SOURCE=700 _DARWIN_C_SOURCE=1)
++        # Guest memory from a Mach memory entry instead of shm_open: required on iOS (the app
++        # sandbox denies POSIX shared memory); optional on macOS to test the iOS path on a Mac.
++        if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
++            set(_rex_mach_memory_default ON)
++        else()
++            set(_rex_mach_memory_default OFF)
++        endif()
++        option(REXGLUE_APPLE_MACH_MEMORY "Back guest memory with a Mach memory entry (iOS)"
++               ${_rex_mach_memory_default})
++        if(REXGLUE_APPLE_MACH_MEMORY)
++            target_compile_definitions(rexcore PRIVATE REXGLUE_APPLE_MACH_MEMORY=1)
++        endif()
+     else()
+         target_link_libraries(rexcore PRIVATE pthread rt dl)
+     endif()
+diff --git a/src/core/memory_posix.cpp b/src/core/memory_posix.cpp
+index 40a1210..e39fede 100644
+--- a/src/core/memory_posix.cpp
++++ b/src/core/memory_posix.cpp
+@@ -39,13 +39,27 @@
+ #endif
+ 
+ #if REX_PLATFORM_MAC
++#include <TargetConditionals.h>
+ #include <mach/mach.h>
++#include <mach/vm_map.h>
++#if !TARGET_OS_IOS
+ #include <mach/mach_vm.h>
++#endif
+ // off_t is always 64-bit on Darwin; there are no separate *64 functions.
+ #define ftruncate64 ftruncate
+ #define mmap64 mmap
+ #endif
+ 
++// Guest memory backing on Apple: iOS apps cannot use shm_open (the sandbox denies POSIX shared
++// memory), so the guest "page file" is a named Mach memory entry (mach_make_memory_entry_64) and
++// views are vm_map'ed from it. REXGLUE_APPLE_MACH_MEMORY selects this; it is on for iOS and can be
++// turned on for macOS builds to test the iOS path on a Mac.
++#if REX_PLATFORM_MAC && defined(REXGLUE_APPLE_MACH_MEMORY) && REXGLUE_APPLE_MACH_MEMORY
++#define REX_APPLE_MACH_MEMORY 1
++#else
++#define REX_APPLE_MACH_MEMORY 0
++#endif
++
+ namespace rex {
+ namespace memory {
+ 
+@@ -168,14 +182,28 @@ static bool ParseProcMapsLine(const std::string& line, LinuxMapEntry& out) {
+ // Darwin has no /proc/self/maps; mach_vm_region returns the region at or above an address with
+ // its current protection, which is filled into the same entry shape as the Linux parser's.
+ static bool DarwinRegionAtOrAbove(uintptr_t address, LinuxMapEntry& out) {
+-  mach_vm_address_t region_address = address;
+-  mach_vm_size_t region_size = 0;
+   vm_region_basic_info_data_64_t info;
+   mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
+   mach_port_t object_name = MACH_PORT_NULL;
+-  if (mach_vm_region(mach_task_self(), &region_address, &region_size, VM_REGION_BASIC_INFO_64,
+-                     reinterpret_cast<vm_region_info_t>(&info), &count,
+-                     &object_name) != KERN_SUCCESS) {
++#if TARGET_OS_IOS
++  // <mach/mach_vm.h> is not part of the iOS SDK; vm_region_64 is the same call with
++  // pointer-sized (64-bit on arm64) addresses.
++  vm_address_t region_address = vm_address_t(address);
++  vm_size_t region_size = 0;
++  const kern_return_t kr =
++      vm_region_64(mach_task_self(), &region_address, &region_size, VM_REGION_BASIC_INFO_64,
++                   reinterpret_cast<vm_region_info_t>(&info), &count, &object_name);
++#else
++  mach_vm_address_t region_address = address;
++  mach_vm_size_t region_size = 0;
++  const kern_return_t kr =
++      mach_vm_region(mach_task_self(), &region_address, &region_size, VM_REGION_BASIC_INFO_64,
++                     reinterpret_cast<vm_region_info_t>(&info), &count, &object_name);
++#endif
++  if (object_name != MACH_PORT_NULL) {
++    mach_port_deallocate(mach_task_self(), object_name);
++  }
++  if (kr != KERN_SUCCESS) {
+     return false;
+   }
+   out = LinuxMapEntry{};
+@@ -429,9 +457,46 @@ bool QueryProtect(void* base_address, size_t& length, PageAccess& access_out) {
+ #endif
+ }
+ 
++#if REX_APPLE_MACH_MEMORY
++static vm_prot_t ToMachProtect(PageAccess access) {
++  switch (access) {
++    case PageAccess::kReadOnly:
++      return VM_PROT_READ;
++    case PageAccess::kReadWrite:
++      return VM_PROT_READ | VM_PROT_WRITE;
++    case PageAccess::kExecuteReadOnly:
++      return VM_PROT_READ | VM_PROT_EXECUTE;
++    case PageAccess::kExecuteReadWrite:
++      return VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE;
++    case PageAccess::kNoAccess:
++    default:
++      return VM_PROT_NONE;
++  }
++}
++#endif
++
+ FileMappingHandle CreateFileMappingHandle(const std::filesystem::path& path, size_t length,
+                                           PageAccess access, bool commit) {
+-#if REX_PLATFORM_ANDROID
++#if REX_APPLE_MACH_MEMORY
++  // A named memory entry: zero-filled, backed by anonymous (compressible) memory that is only
++  // allocated when touched. Every view vm_map'ed from it shares the same pages.
++  (void)path;
++  (void)access;
++  (void)commit;
++  memory_object_size_t size = memory_object_size_t(length);
++  mach_port_t entry = MACH_PORT_NULL;
++  const kern_return_t kr =
++      mach_make_memory_entry_64(mach_task_self(), &size, 0,
++                                MAP_MEM_NAMED_CREATE | VM_PROT_READ | VM_PROT_WRITE, &entry,
++                                MACH_PORT_NULL);
++  if (kr != KERN_SUCCESS || size < length) {
++    if (entry != MACH_PORT_NULL) {
++      mach_port_deallocate(mach_task_self(), entry);
++    }
++    return kFileMappingHandleInvalid;
++  }
++  return static_cast<FileMappingHandle>(entry);
++#elif REX_PLATFORM_ANDROID
+   // TODO(Triang3l): Check if memfd can be used instead on API 30+.
+   if (android_ASharedMemory_create_) {
+     int sharedmem_fd = android_ASharedMemory_create_(path.c_str(), length);
+@@ -488,6 +553,11 @@ FileMappingHandle CreateFileMappingHandle(const std::filesystem::path& path, siz
+ }
+ 
+ void CloseFileMappingHandle(FileMappingHandle handle, const std::filesystem::path& path) {
++#if REX_APPLE_MACH_MEMORY
++  (void)path;
++  mach_port_deallocate(mach_task_self(), static_cast<mach_port_t>(handle));
++  return;
++#endif
+   close(static_cast<int>(handle));
+ #if !REX_PLATFORM_ANDROID
+   auto full_path = MakeShmName(path);
+@@ -522,6 +592,29 @@ void* MapFileView(FileMappingHandle handle, void* base_address, size_t length, P
+     flags |= MAP_FIXED;
+   }
+ 
++#if REX_APPLE_MACH_MEMORY
++  {
++    vm_address_t address = vm_address_t(base_address);
++    const vm_prot_t protection = ToMachProtect(access);
++    // max_protection read/write so later Protect() (mprotect) calls - write watches, MMIO ranges -
++    // can raise access again; copy=FALSE so every view shares the entry's pages.
++    const kern_return_t kr =
++        vm_map(mach_task_self(), &address, vm_size_t(length), 0,
++               base_address ? VM_FLAGS_FIXED : VM_FLAGS_ANYWHERE,
++               static_cast<mem_entry_name_port_t>(handle), memory_object_offset_t(file_offset),
++               FALSE, protection, VM_PROT_READ | VM_PROT_WRITE, VM_INHERIT_NONE);
++    (void)flags;
++    if (kr != KERN_SUCCESS) {
++      return nullptr;
++    }
++    if (base_address && reinterpret_cast<void*>(address) != base_address) {
++      vm_deallocate(mach_task_self(), address, vm_size_t(length));
++      return nullptr;
++    }
++    return reinterpret_cast<void*>(address);
++  }
++#endif
++
+   uint32_t prot = ToPosixProtectFlags(access);
+   void* result = mmap64(base_address, length, prot, flags, static_cast<int>(handle),
+                         static_cast<off_t>(file_offset));
+@@ -539,7 +632,13 @@ void* MapFileView(FileMappingHandle handle, void* base_address, size_t length, P
+ }
+ 
+ bool UnmapFileView(FileMappingHandle handle, void* base_address, size_t length) {
++#if REX_APPLE_MACH_MEMORY
++  (void)handle;
++  return vm_deallocate(mach_task_self(), vm_address_t(base_address), vm_size_t(length)) ==
++         KERN_SUCCESS;
++#else
+   return munmap(base_address, length) == 0;
++#endif
+ }
+ 
+ }  // namespace memory
+diff --git a/src/ui/windowed_app_context_sdl.cpp b/src/ui/windowed_app_context_sdl.cpp
+index 1b4ef0a..eef1d97 100644
+--- a/src/ui/windowed_app_context_sdl.cpp
++++ b/src/ui/windowed_app_context_sdl.cpp
+@@ -16,8 +16,25 @@ namespace ui {
+ 
+ SDLWindowedAppContext::SDLWindowedAppContext() = default;
+ 
++bool SDLWindowedAppContext::AppLifecycleWatch(void* userdata, SDL_Event* event) {
++  auto* context = static_cast<SDLWindowedAppContext*>(userdata);
++  switch (event->type) {
++    case SDL_EVENT_WILL_ENTER_BACKGROUND:
++    case SDL_EVENT_DID_ENTER_BACKGROUND:
++      context->in_background_ = true;
++      break;
++    case SDL_EVENT_DID_ENTER_FOREGROUND:
++      context->in_background_ = false;
++      break;
++    default:
++      break;
++  }
++  return true;  // the event is still queued as usual
++}
++
+ SDLWindowedAppContext::~SDLWindowedAppContext() {
+   if (sdl_initialized_) {
++    SDL_RemoveEventWatch(AppLifecycleWatch, this);
+     SDL_QuitSubSystem(SDL_INIT_VIDEO | SDL_INIT_EVENTS);
+   }
+ }
+@@ -41,6 +58,7 @@ bool SDLWindowedAppContext::Initialize() {
+   }
+   pending_functions_event_type_ = first_event;
+   paint_event_type_ = first_event + 1;
++  SDL_AddEventWatch(AppLifecycleWatch, this);
+   return true;
+ }
+ 
+@@ -132,12 +150,23 @@ void SDLWindowedAppContext::DispatchEvent(const SDL_Event& event) {
+       std::lock_guard<std::mutex> lock(paint_queued_mutex_);
+       paint_queued_[event.user.windowID] = false;
+     }
++    if (in_background_) {
++      // No GPU work while the app is in the background (iOS); repainted on return.
++      return;
++    }
+     auto it = windows_.find(event.user.windowID);
+     if (it != windows_.end()) {
+       it->second->HandlePaintEvent();
+     }
+     return;
+   }
++  if (event.type == SDL_EVENT_DID_ENTER_FOREGROUND) {
++    for (const auto& [window_id, window] : windows_) {
++      (void)window;
++      RequestPaint(window_id);
++    }
++    return;
++  }
+   if (event.type == SDL_EVENT_QUIT) {
+     // Application-level quit (Cmd+Q, or the iOS app being terminated): close every window, which
+     // lets the app shut the emulation down the same way as closing the window does.
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+index 55034bb..26e3974 100644
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -1,6 +1,13 @@
+ # ReXGlue Tests
+ # Test infrastructure for PPC instruction validation and unit tests
+ 
++if(REX_PLATFORM_IOS_BUILD)
++    # iOS: only the smoke test (an app bundle); the unit and instruction tests are command-line
++    # programs that need the host code generator.
++    add_subdirectory(smoke)
++    return()
++endif()
++
+ # Unit tests for core components
+ add_subdirectory(unit)
+ 
+diff --git a/tests/smoke/CMakeLists.txt b/tests/smoke/CMakeLists.txt
+index aaf7150..7db5eb7 100644
+--- a/tests/smoke/CMakeLists.txt
++++ b/tests/smoke/CMakeLists.txt
+@@ -28,3 +28,30 @@ if(UNIX AND NOT APPLE)
+     target_link_libraries(rex_smoke PRIVATE ${SMOKE_GTK3_LIBRARIES})
+ endif()
+ set_target_properties(rex_smoke PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests/bin)
++
++# iOS / iPadOS: rex_smoke is an app bundle (Info.plist, entitlements, embedded MoltenVK).
++# REXGLUE_IOS_MOLTENVK_FRAMEWORK is the ios-arm64 MoltenVK.framework (dynamic), for example from
++# MoltenVK.xcframework/ios-arm64/ in a MoltenVK release; tools/build-ios.sh downloads one.
++if(REX_PLATFORM_IOS_BUILD)
++    set(REXGLUE_IOS_MOLTENVK_FRAMEWORK "" CACHE PATH "ios-arm64 MoltenVK.framework to embed")
++    set_target_properties(rex_smoke PROPERTIES
++        MACOSX_BUNDLE TRUE
++        MACOSX_BUNDLE_INFO_PLIST ${PROJECT_SOURCE_DIR}/cmake/ios/Info.plist.in
++        MACOSX_BUNDLE_GUI_IDENTIFIER "com.rexglue.smoke"
++        MACOSX_BUNDLE_BUNDLE_NAME "ReX Smoke"
++        MACOSX_BUNDLE_SHORT_VERSION_STRING "1.0"
++        MACOSX_BUNDLE_BUNDLE_VERSION "1"
++        BUILD_WITH_INSTALL_RPATH TRUE
++        INSTALL_RPATH "@executable_path/Frameworks"
++    )
++    if(REXGLUE_IOS_MOLTENVK_FRAMEWORK)
++        add_custom_command(TARGET rex_smoke POST_BUILD
++            COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_BUNDLE_DIR:rex_smoke>/Frameworks"
++            COMMAND ${CMAKE_COMMAND} -E copy_directory "${REXGLUE_IOS_MOLTENVK_FRAMEWORK}"
++                    "$<TARGET_BUNDLE_DIR:rex_smoke>/Frameworks/MoltenVK.framework"
++            VERBATIM)
++    else()
++        message(WARNING "REXGLUE_IOS_MOLTENVK_FRAMEWORK is not set: rex_smoke.app will not find "
++                        "a Vulkan driver on the device")
++    endif()
++endif()
+diff --git a/tests/smoke/smoke_app.cpp b/tests/smoke/smoke_app.cpp
+index a32096a..f1e7ef3 100644
+--- a/tests/smoke/smoke_app.cpp
++++ b/tests/smoke/smoke_app.cpp
+@@ -20,6 +20,7 @@
+ #include <deque>
+ #include <memory>
+ #include <string>
++#include <thread>
+ 
+ #include <imgui.h>
+ 
+@@ -27,6 +28,7 @@
+ #include <rex/logging.h>
+ #include <rex/platform.h>
+ #include <rex/system/xmemory.h>
++#include <rex/thread/fiber.h>
+ #include <rex/ui/imgui_dialog.h>
+ #include <rex/ui/imgui_drawer.h>
+ #include <rex/ui/immediate_drawer.h>
+@@ -158,6 +160,67 @@ MemoryCheck RunMemoryCheck(rex::memory::Memory& memory, MmioCounters& counters)
+   return check;
+ }
+ 
++// --- platform checks (address space, memory limit, fibers) -------------------------------------
++
++}  // namespace
++
++#if REX_PLATFORM_MAC
++#include <mach/mach.h>
++#if defined(TARGET_OS_IOS) && TARGET_OS_IOS
++#include <os/proc.h>
++#endif
++#endif
++
++namespace {
++
++struct PlatformCheck {
++  // Address range the process may map (Apple: task_vm_info). Without the extended virtual
++  // addressing entitlement iOS caps it, and the ~4.5 GB guest reservation may not fit.
++  uint64_t min_address = 0;
++  uint64_t max_address = 0;
++  // Memory the system still lets this process use (iOS: os_proc_available_memory), in bytes.
++  uint64_t available_memory = 0;
++  bool fiber_ok = false;
++};
++
++void FiberEntry(void* arg) {
++  auto* state = static_cast<std::pair<rex::thread::Fiber*, int>*>(arg);
++  state->second += 1;
++  rex::thread::Fiber::SwitchTo(state->first);
++  state->second += 1;
++  rex::thread::Fiber::SwitchTo(state->first);
++}
++
++PlatformCheck RunPlatformCheck() {
++  PlatformCheck check;
++#if REX_PLATFORM_MAC
++  task_vm_info_data_t vm_info{};
++  mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
++  if (task_info(mach_task_self(), TASK_VM_INFO, reinterpret_cast<task_info_t>(&vm_info), &count) ==
++      KERN_SUCCESS) {
++    check.min_address = vm_info.min_address;
++    check.max_address = vm_info.max_address;
++  }
++#if defined(TARGET_OS_IOS) && TARGET_OS_IOS
++  check.available_memory = os_proc_available_memory();
++#endif
++#endif
++  // Fibers (ucontext on POSIX): a round trip on a helper thread, so a failure cannot take the UI
++  // thread's context with it.
++  std::thread([&check] {
++    auto* main_fiber = rex::thread::Fiber::ConvertCurrentThread();
++    std::pair<rex::thread::Fiber*, int> state(main_fiber, 0);
++    auto* fiber = rex::thread::Fiber::Create(256 * 1024, FiberEntry, &state);
++    if (main_fiber && fiber) {
++      rex::thread::Fiber::SwitchTo(fiber);
++      rex::thread::Fiber::SwitchTo(fiber);
++      check.fiber_ok = state.second == 2;
++      fiber->Destroy();
++    }
++  }).join();
++  return check;
++}
++
+ // --- UI -----------------------------------------------------------------------------------------
+ 
+ class SmokeApp;
+@@ -186,6 +249,18 @@ class SmokeApp final : public rex::ui::WindowedApp,
+     std::printf("[smoke] %s %s\n", PlatformName(), ArchName());
+ 
+     memory_ = std::make_unique<rex::memory::Memory>();
++    platform_check_ = RunPlatformCheck();
++    if (platform_check_.max_address) {
++      std::printf("[smoke] address space %#llx-%#llx (%.1f GB)\n",
++                  static_cast<unsigned long long>(platform_check_.min_address),
++                  static_cast<unsigned long long>(platform_check_.max_address),
++                  double(platform_check_.max_address - platform_check_.min_address) / (1u << 30));
++    }
++    if (platform_check_.available_memory) {
++      std::printf("[smoke] memory available to the app: %.2f GB\n",
++                  double(platform_check_.available_memory) / (1u << 30));
++    }
++    std::printf("[smoke] fibers: %s\n", platform_check_.fiber_ok ? "PASS" : "FAIL");
+     memory_check_ = RunMemoryCheck(*memory_, mmio_counters_);
+     std::printf("[smoke] guest memory: %s (base %#llx)%s%s\n",
+                 memory_check_.passed() ? "PASS" : "FAIL",
+@@ -280,6 +355,17 @@ class SmokeApp final : public rex::ui::WindowedApp,
+     ImGui::Text("Frames: %llu   %.1f fps   (%.0f s)", static_cast<unsigned long long>(frames_),
+                 Fps(), elapsed);
+     ImGui::Separator();
++    if (platform_check_.max_address) {
++      ImGui::Text("Address space: %#llx-%#llx (%.1f GB)",
++                  static_cast<unsigned long long>(platform_check_.min_address),
++                  static_cast<unsigned long long>(platform_check_.max_address),
++                  double(platform_check_.max_address - platform_check_.min_address) / (1u << 30));
++    }
++    if (platform_check_.available_memory) {
++      ImGui::Text("Memory available to the app: %.2f GB",
++                  double(platform_check_.available_memory) / (1u << 30));
++    }
++    ImGui::Text("Fibers: %s", platform_check_.fiber_ok ? "ok" : "FAIL");
+     ImGui::Text("Guest memory: %s", memory_check_.passed() ? "PASS" : "FAIL");
+     ImGui::Text("  reserve %s, access %s, MMIO write %s, MMIO read %s",
+                 memory_check_.initialized ? "ok" : "FAIL",
+@@ -309,7 +395,9 @@ class SmokeApp final : public rex::ui::WindowedApp,
+     presenter_->RequestUIPaintFromUIThread();
+   }
+ 
+-  bool all_passed() const { return memory_check_.passed() && frames_ > 10; }
++  bool all_passed() const {
++    return memory_check_.passed() && platform_check_.fiber_ok && frames_ > 10;
++  }
+ 
+   // WindowListener
+   void OnClosing(rex::ui::UIEvent&) override { app_context().QuitFromUIThread(); }
+@@ -422,6 +510,7 @@ class SmokeApp final : public rex::ui::WindowedApp,
+   std::unique_ptr<rex::memory::Memory> memory_;
+   MmioCounters mmio_counters_;
+   MemoryCheck memory_check_;
++  PlatformCheck platform_check_;
+   std::unique_ptr<rex::ui::GraphicsProvider> provider_;
+   std::unique_ptr<rex::ui::Window> window_;
+   std::unique_ptr<rex::ui::Presenter> presenter_;
+-- 
+2.43.0
+

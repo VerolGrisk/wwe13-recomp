@@ -268,6 +268,43 @@ Not problems, though they look like them in the log:
   (`mach_make_memory_entry_64` + `vm_map`), and the ~8 GB layout needs the extended virtual
   addressing entitlement.
 
+## Step 3 – iOS / iPadOS (in progress)
+
+First milestone: **`rex_smoke` as an iPad app**, signed by a signing service and installed on the
+device. It checks the window, MoltenVK on the iPad GPU, the guest memory layout (on iOS backed by a
+Mach memory entry), MMIO traps, fibers, and how much address space and memory iOS gives the app.
+No game files are needed. Code in ReXGlue patch 0116; scripts in this repository.
+
+| Area | Change |
+| --- | --- |
+| Build | `cmake/toolchains/ios-arm64.cmake` (device only, iOS 17+); on iOS the SDK skips the host tools (codegen, `rexglue` CLI) and the unit/instruction tests, and links FFmpeg statically |
+| Guest memory | iOS denies `shm_open`: `REXGLUE_APPLE_MACH_MEMORY` backs guest memory with a named Mach memory entry (`mach_make_memory_entry_64`) whose views are `vm_map`ed; region queries use `vm_region_64` (no `<mach/mach_vm.h>` in the iOS SDK). On by default for iOS, optional on macOS |
+| Vulkan | No loader on iOS: MoltenVK's dynamic framework is embedded in `Frameworks/` and loaded in the loader's place (it exports `vkGetInstanceProcAddr`) |
+| App | `cmake/ios/Info.plist.in` (full screen, landscape, file sharing, controllers, pointer), `cmake/ios/app.entitlements` (extended virtual addressing, increased memory limit) |
+| Lifecycle | No painting between "will enter background" and "did enter foreground" (iOS does not allow GPU work in the background) |
+| Smoke test | Also reports the address-space range (`task_vm_info`), the memory available to the app (`os_proc_available_memory`) and a fiber round trip |
+
+### Testing the iOS memory path on the Mac first
+
+```bash
+MACH_MEMORY=1 REXGLUE_TESTS=1 PPC_BINUTILS_DIR=$PWD/../tools/ppc-binutils-vmx128/bin ./tools/setup-macos.sh
+../tools/rexglue/out/build/macos-arm64-mach/tests/bin/RelWithDebInfo/unit_tests
+../tools/rexglue/out/build/macos-arm64-mach/tests/bin/RelWithDebInfo/rex_smoke --smoke_seconds=10
+```
+
+### Building the IPA
+
+```bash
+./tools/setup-macos.sh        # once: fetches and patches the SDK
+./tools/build-ios.sh          # downloads MoltenVK v1.4.2 for iOS, builds, packages
+# -> out/ios/ReXSmoke.ipa (ad-hoc signed with the entitlements; re-sign with your service)
+```
+
+On the iPad the overlay shows the checks. **Address space** is the key line: the guest layout
+needs a contiguous ~4.5 GB block, so if the signing service dropped the extended virtual
+addressing entitlement, this range is small and **Guest memory** fails. Logs are in the app's
+Documents folder (Files app > On My iPad > ReX Smoke).
+
 ## Planned next steps
 
 - **Step 2 – macOS (Apple Silicon):** add the Apple platform to the SDK build, port items 2–4 for Darwin, and

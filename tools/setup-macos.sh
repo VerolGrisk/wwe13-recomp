@@ -20,6 +20,8 @@
 #   PPC_BINUTILS_DIR  folder holding powerpc-none-elf-{as,ld,nm} (only with REXGLUE_TESTS=1)
 #   CONFIG            build configuration (default RelWithDebInfo)
 #   KEEP_GOING=1      keep building past failed files, so one run reports every error (CI)
+#   MACH_MEMORY=1     back guest memory with a Mach memory entry, as the iOS build does, to test
+#                     that path on the Mac (separate build: out/build/macos-arm64-mach)
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
@@ -81,12 +83,19 @@ if [ "$REXGLUE_TESTS" = "1" ]; then
 fi
 
 BUILD_DIR="$SDK/out/build/macos-arm64"
+INSTALL_DIR="$SDK/out/install/macos-arm64"
+MACH_ARGS=()
+if [ "${MACH_MEMORY:-0}" = "1" ]; then
+  BUILD_DIR="$SDK/out/build/macos-arm64-mach"
+  INSTALL_DIR="$SDK/out/install/macos-arm64-mach"
+  MACH_ARGS=(-DREXGLUE_APPLE_MACH_MEMORY=ON)
+fi
 if [ ! -f "$BUILD_DIR/CMakeCache.txt" ]; then
   cmake -S "$SDK" -B "$BUILD_DIR" -G "Ninja Multi-Config" \
     -DCMAKE_C_COMPILER="$CC" -DCMAKE_CXX_COMPILER="$CXX" \
     -DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_OSX_DEPLOYMENT_TARGET=14.0 \
     -DCMAKE_CONFIGURATION_TYPES="Debug;Release;RelWithDebInfo" \
-    -DCMAKE_INSTALL_PREFIX="$SDK/out/install/macos-arm64" \
+    -DCMAKE_INSTALL_PREFIX="$INSTALL_DIR" ${MACH_ARGS[@]+"${MACH_ARGS[@]}"} \
     "${TEST_ARGS[@]}" -DREXGLUE_ENABLE_FIDELITYFX=OFF -DREXGLUE_ENABLE_PERF_COUNTERS=OFF \
     -DREXGLUE_ENABLE_SANITIZERS=OFF -DREXGLUE_ENABLE_TRACY=OFF -DREXGLUE_FFMPEG_SHARED=ON \
     -DREXGLUE_PROFILE_GUEST_FUNCTIONS=OFF -DREXGLUE_USE_VULKAN=ON
