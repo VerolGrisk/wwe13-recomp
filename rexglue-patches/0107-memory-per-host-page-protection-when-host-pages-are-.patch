@@ -1,0 +1,356 @@
+From 59c086f677806dd45e4f03e2ec657396f1491a81 Mon Sep 17 00:00:00 2001
+From: WWE13 Recomp <wwe13-recomp@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 19:43:16 -0500
+Subject: [PATCH] memory: per-host-page protection when host pages are larger
+ than guest pages
+
+Apple silicon uses 16 KB host pages, but most guest heaps use 4 KB pages.
+mprotect on a 4 KB-aligned address that is not 16 KB-aligned fails, so
+4 KB BaseHeap::Alloc (commit) and Protect calls failed on macOS.
+
+When a host page holds several guest pages, BaseHeap now keeps the exact
+protection in the page table and gives each host page the most
+permissive protection of the committed guest pages inside it
+(UpdateHostAccess). Alloc, AllocFixed, Protect, Release (with
+protect_on_release), Save and Restore use it. Protect returns the old
+protection from the page table. PhysicalHeap keeps write-watched host
+pages read-only, so a commit or protect of a neighbouring guest page in
+the same host page does not drop a GPU write watch.
+
+Trade-off: a no-access or read-only 4 KB guest page that shares a host
+page with a more accessible committed page does not fault on the host.
+
+Heaps whose page size is at least the host page size (every heap on
+Windows and on 4 KB-page Linux) keep the previous code.
+
+unit_tests on macOS arm64: 186 pass, 5 skipped, 0 fail (was 6-10 fail).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ include/rex/system/xmemory.h |  24 +++++
+ src/system/xmemory.cpp       | 172 ++++++++++++++++++++++++++++++++++-
+ 2 files changed, 195 insertions(+), 1 deletion(-)
+
+diff --git a/include/rex/system/xmemory.h b/include/rex/system/xmemory.h
+index 20624af..5f1a5be 100644
+--- a/include/rex/system/xmemory.h
++++ b/include/rex/system/xmemory.h
+@@ -217,6 +217,26 @@ class BaseHeap {
+   void Initialize(memory::Memory* memory, uint8_t* membase, HeapType heap_type, uint32_t heap_base,
+                   uint32_t heap_size, uint32_t page_size, uint32_t host_address_offset = 0);
+ 
++  // True when one host page holds several guest pages (4 KB guest pages on a host with 16 KB
++  // pages, such as Apple silicon). Host protection is then per host page and is derived from the
++  // page table by UpdateHostAccess; the page table keeps the exact per-guest-page protection.
++  bool host_pages_hold_several_guest_pages() const { return page_size_ < host_page_size_; }
++
++  // Sets the host protection of every host page overlapping guest pages
++  // [start_page_number, end_page_number] to the most permissive protection of the committed guest
++  // pages in it (no access if none are committed), after AdjustHostPageAccess. Caller holds
++  // heap_mutex_. Only used when host_pages_hold_several_guest_pages().
++  void UpdateHostAccess(uint32_t start_page_number, uint32_t end_page_number);
++
++  // Lets a heap make a host page's protection stricter than its guest pages need (physical heaps
++  // keep write-watched host pages read-only). host_page_offset is relative to
++  // membase_ + heap_base_, in bytes, and host page aligned.
++  virtual rex::memory::PageAccess AdjustHostPageAccess(size_t host_page_offset,
++                                                       rex::memory::PageAccess access) {
++    (void)host_page_offset;
++    return access;
++  }
++
+   memory::Memory* memory_;
+   uint8_t* membase_;
+   HeapType heap_type_;
+@@ -225,6 +245,7 @@ class BaseHeap {
+   uint32_t page_size_;
+   uint32_t page_size_shift_ = 0;
+   uint32_t host_address_offset_;
++  uint32_t host_page_size_ = 0;
+   uint32_t unreserved_page_count_ = 0;
+   rex::thread::global_critical_region global_critical_region_;
+   std::recursive_mutex heap_mutex_;
+@@ -282,6 +303,9 @@ class PhysicalHeap : public BaseHeap {
+   uint32_t GetPhysicalAddress(uint32_t address) const;
+ 
+  protected:
++  rex::memory::PageAccess AdjustHostPageAccess(size_t host_page_offset,
++                                               rex::memory::PageAccess access) override;
++
+   VirtualHeap* parent_heap_;
+ 
+   uint32_t system_page_size_;
+diff --git a/src/system/xmemory.cpp b/src/system/xmemory.cpp
+index 6673624..24e24c6 100644
+--- a/src/system/xmemory.cpp
++++ b/src/system/xmemory.cpp
+@@ -1105,10 +1105,90 @@ void BaseHeap::Initialize(memory::Memory* memory, uint8_t* membase, HeapType hea
+   assert_true(rex::is_pow2(page_size_));
+   page_size_shift_ = rex::log2_floor(page_size_);
+   host_address_offset_ = host_address_offset;
++  host_page_size_ = uint32_t(rex::memory::page_size());
+   page_table_.resize(heap_size / page_size);
+   unreserved_page_count_ = uint32_t(page_table_.size());
+ }
+ 
++namespace {
++// Orders host accesses from strictest to most permissive (execute is never requested by guest
++// heaps: ToPageAccess only returns these three).
++int HostAccessRank(rex::memory::PageAccess access) {
++  switch (access) {
++    case rex::memory::PageAccess::kReadWrite:
++      return 2;
++    case rex::memory::PageAccess::kReadOnly:
++      return 1;
++    default:
++      return 0;
++  }
++}
++}  // namespace
++
++void BaseHeap::UpdateHostAccess(uint32_t start_page_number, uint32_t end_page_number) {
++  if (page_table_.empty() || start_page_number > end_page_number) {
++    return;
++  }
++  end_page_number = std::min(end_page_number, uint32_t(page_table_.size() - 1));
++  const size_t host_page = host_page_size_;
++  // Host offsets are relative to membase_ + heap_base_, which is host page aligned; guest page
++  // n starts at host offset host_address_offset_ + (n << page_size_shift_).
++  const size_t heap_host_end = size_t(host_address_offset_) + size_t(heap_size_);
++  const size_t first_host_offset =
++      (size_t(host_address_offset_) + (size_t(start_page_number) << page_size_shift_)) &
++      ~(host_page - 1);
++  const size_t last_host_end = rex::round_up(
++      size_t(host_address_offset_) + (size_t(end_page_number + 1) << page_size_shift_),
++      host_page);
++  uint8_t* host_base = membase_ + heap_base_;
++
++  size_t run_offset = 0;
++  size_t run_length = 0;
++  rex::memory::PageAccess run_access = rex::memory::PageAccess::kNoAccess;
++  auto flush_run = [&]() {
++    if (run_length &&
++        !rex::memory::Protect(host_base + run_offset, run_length, run_access, nullptr)) {
++      REXSYS_WARN("BaseHeap::UpdateHostAccess: host protect of {} bytes at heap offset {:X} failed",
++                  run_length, run_offset);
++    }
++    run_length = 0;
++  };
++
++  for (size_t host_offset = first_host_offset; host_offset < last_host_end;
++       host_offset += host_page) {
++    // Guest pages of this heap inside [host_offset, host_offset + host_page).
++    const size_t guest_begin = std::max(host_offset, size_t(host_address_offset_));
++    const size_t guest_end = std::min(host_offset + host_page, heap_host_end);
++    rex::memory::PageAccess access = rex::memory::PageAccess::kNoAccess;
++    if (guest_begin < guest_end) {
++      const uint32_t first_page =
++          uint32_t((guest_begin - host_address_offset_) >> page_size_shift_);
++      const uint32_t last_page =
++          uint32_t((guest_end - 1 - host_address_offset_) >> page_size_shift_);
++      for (uint32_t page_number = first_page; page_number <= last_page; ++page_number) {
++        const auto& page_entry = page_table_[page_number];
++        if (!(page_entry.state & memory::kMemoryAllocationCommit)) {
++          continue;
++        }
++        const rex::memory::PageAccess page_access = ToPageAccess(page_entry.current_protect);
++        if (HostAccessRank(page_access) > HostAccessRank(access)) {
++          access = page_access;
++        }
++      }
++    }
++    access = AdjustHostPageAccess(host_offset, access);
++    if (run_length && (access != run_access || run_offset + run_length != host_offset)) {
++      flush_run();
++    }
++    if (!run_length) {
++      run_offset = host_offset;
++      run_access = access;
++    }
++    run_length += host_page;
++  }
++  flush_run();
++}
++
+ void BaseHeap::Dispose() {
+   // Walk table and release all regions.
+   for (uint32_t page_number = 0; page_number < page_table_.size(); ++page_number) {
+@@ -1216,6 +1296,15 @@ bool BaseHeap::Save(stream::ByteStream* stream) {
+     if (page.state & memory::kMemoryAllocationCommit) {
+       void* addr = TranslateRelative(i << page_size_shift_);
+ 
++      if (host_pages_hold_several_guest_pages()) {
++        // Open the whole host page; host access is rebuilt from the page table at the end.
++        auto* host_page = reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(addr) &
++                                                  ~uintptr_t(host_page_size_ - 1));
++        memory::Protect(host_page, host_page_size_, memory::PageAccess::kReadWrite, nullptr);
++        stream->Write(addr, page_size_);
++        continue;
++      }
++
+       memory::PageAccess old_access;
+       memory::Protect(addr, page_size_, memory::PageAccess::kReadWrite, &old_access);
+ 
+@@ -1224,6 +1313,9 @@ bool BaseHeap::Save(stream::ByteStream* stream) {
+       memory::Protect(addr, page_size_, old_access, nullptr);
+     }
+   }
++  if (host_pages_hold_several_guest_pages()) {
++    UpdateHostAccess(0, uint32_t(page_table_.size() - 1));
++  }
+ 
+   return true;
+ }
+@@ -1247,6 +1339,19 @@ bool BaseHeap::Restore(stream::ByteStream* stream) {
+       page_access = memory::PageAccess::kReadOnly;
+     }
+ 
++    if (host_pages_hold_several_guest_pages()) {
++      // Open the whole host page; host access is rebuilt from the page table at the end.
++      if (page.state & memory::kMemoryAllocationCommit) {
++        void* addr = TranslateRelative(i << page_size_shift_);
++        auto* host_page = reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(addr) &
++                                                  ~uintptr_t(host_page_size_ - 1));
++        rex::memory::Protect(host_page, host_page_size_, memory::PageAccess::kReadWrite,
++                             nullptr);
++        stream->Read(addr, page_size_);
++      }
++      continue;
++    }
++
+     // Commit the memory if it isn't already. We do not need to reserve any
+     // memory, as the mapping has already taken care of that.
+     if (page.state & memory::kMemoryAllocationCommit) {
+@@ -1266,6 +1371,9 @@ bool BaseHeap::Restore(stream::ByteStream* stream) {
+       rex::memory::Protect(addr, page_size_, page_access, nullptr);
+     }
+   }
++  if (host_pages_hold_several_guest_pages()) {
++    UpdateHostAccess(0, uint32_t(page_table_.size() - 1));
++  }
+ 
+   return true;
+ }
+@@ -1436,6 +1544,8 @@ bool BaseHeap::AllocFixed(uint32_t base_address, uint32_t size, uint32_t alignme
+   // Allocate from host.
+   if (allocation_type == memory::kMemoryAllocationReserve) {
+     // Reserve is not needed, as we are mapped already.
++  } else if (host_pages_hold_several_guest_pages()) {
++    // Host access is per host page; it is set from the page table after the update below.
+   } else {
+     auto alloc_type = (allocation_type & memory::kMemoryAllocationCommit)
+                           ? rex::memory::AllocationType::kCommit
+@@ -1469,6 +1579,15 @@ bool BaseHeap::AllocFixed(uint32_t base_address, uint32_t size, uint32_t alignme
+     page_entry.state = memory::kMemoryAllocationReserve | allocation_type;
+   }
+ 
++  if (allocation_type != memory::kMemoryAllocationReserve &&
++      host_pages_hold_several_guest_pages()) {
++    UpdateHostAccess(start_page_number, end_page_number);
++    if (REXCVAR_GET(scribble_heap) && (protect & memory::kMemoryProtectWrite)) {
++      std::memset(TranslateRelative(start_page_number << page_size_shift_), 0xCD,
++                  page_count << page_size_shift_);
++    }
++  }
++
+   return true;
+ }
+ 
+@@ -1706,6 +1825,8 @@ bool BaseHeap::AllocRange(uint32_t low_address, uint32_t high_address, uint32_t
+   // Allocate from host.
+   if (allocation_type == memory::kMemoryAllocationReserve) {
+     // Reserve is not needed, as we are mapped already.
++  } else if (host_pages_hold_several_guest_pages()) {
++    // Host access is per host page; it is set from the page table after the update below.
+   } else {
+     auto alloc_type = (allocation_type & memory::kMemoryAllocationCommit)
+                           ? rex::memory::AllocationType::kCommit
+@@ -1736,6 +1857,15 @@ bool BaseHeap::AllocRange(uint32_t low_address, uint32_t high_address, uint32_t
+     page_entry.state = memory::kMemoryAllocationReserve | allocation_type;
+   }
+ 
++  if (allocation_type != memory::kMemoryAllocationReserve &&
++      host_pages_hold_several_guest_pages()) {
++    UpdateHostAccess(start_page_number, end_page_number);
++    if (REXCVAR_GET(scribble_heap) && (protect & memory::kMemoryProtectWrite)) {
++      std::memset(TranslateRelative(start_page_number << page_size_shift_), 0xCD,
++                  page_count << page_size_shift_);
++    }
++  }
++
+   *out_address = heap_base_ + (start_page_number << page_size_shift_);
+   return true;
+ }
+@@ -1798,7 +1928,9 @@ bool BaseHeap::Release(uint32_t base_address, uint32_t* out_region_size) {
+     return false;
+   }*/
+   // Instead, we just protect it, if we can.
+-  if (page_size_ == rex::memory::page_size() ||
++  if (host_pages_hold_several_guest_pages()) {
++    // Done per host page after the table change below.
++  } else if (page_size_ == rex::memory::page_size() ||
+       ((base_page_entry.region_page_count << page_size_shift_) % rex::memory::page_size() == 0 &&
+        ((base_page_number << page_size_shift_) % rex::memory::page_size() == 0))) {
+     // TODO(benvanik): figure out why games are using memory after releasing
+@@ -1820,6 +1952,9 @@ bool BaseHeap::Release(uint32_t base_address, uint32_t* out_region_size) {
+     page_entry.qword = 0;
+     unreserved_page_count_++;
+   }
++  if (host_pages_hold_several_guest_pages() && REXCVAR_GET(protect_on_release)) {
++    UpdateHostAccess(base_page_number, end_page_number);
++  }
+ 
+   return true;
+ }
+@@ -1875,6 +2010,20 @@ bool BaseHeap::Protect(uint32_t address, uint32_t size, uint32_t protect, uint32
+     }
+   }
+ 
++  if (host_pages_hold_several_guest_pages()) {
++    // Host pages are larger than guest pages: keep the exact protection in the page table and
++    // derive host access per host page. The old protection comes from the page table too.
++    if (old_protect) {
++      *old_protect = page_table_[start_page_number].current_protect;
++    }
++    for (uint32_t page_number = start_page_number; page_number <= end_page_number;
++         ++page_number) {
++      page_table_[page_number].current_protect = protect;
++    }
++    UpdateHostAccess(start_page_number, end_page_number);
++    return true;
++  }
++
+   // Attempt host change (hopefully won't fail).
+   // We can only do this if our size matches system page granularity.
+   uint32_t page_count = end_page_number - start_page_number + 1;
+@@ -2063,6 +2212,27 @@ void PhysicalHeap::Initialize(memory::Memory* memory, uint8_t* membase, HeapType
+   system_page_flags_.resize((system_page_count_ + 63) / 64);
+ }
+ 
++rex::memory::PageAccess PhysicalHeap::AdjustHostPageAccess(size_t host_page_offset,
++                                                           rex::memory::PageAccess access) {
++  // Keep write-watched host pages read-only, so committing or protecting a neighbouring guest
++  // page in the same host page does not drop the watch. The flags are read without the global
++  // lock (the heap mutex is held, and the lock order is global, then heap).
++  if (access != rex::memory::PageAccess::kReadWrite || !system_page_size_) {
++    return access;
++  }
++  const size_t system_page = host_page_offset / system_page_size_;
++  if (system_page >= system_page_count_) {
++    return access;
++  }
++  const uint64_t flags = std::atomic_ref<uint64_t>(
++                             system_page_flags_[system_page >> 6].notify_on_invalidation)
++                             .load(std::memory_order_relaxed);
++  if (flags & (uint64_t(1) << (system_page & 63))) {
++    return rex::memory::PageAccess::kReadOnly;
++  }
++  return access;
++}
++
+ bool PhysicalHeap::Alloc(uint32_t size, uint32_t alignment, uint32_t allocation_type,
+                          uint32_t protect, bool top_down, uint32_t* out_address) {
+   *out_address = 0;
+-- 
+2.54.0 (Apple Git-157)
+

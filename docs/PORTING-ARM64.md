@@ -85,8 +85,8 @@ These parts work on Linux ARM64 but need Apple-specific code:
 
 Code for the Apple platform, written without a Mac and checked by the **macOS port build check**
 workflow (`.github/workflows/macos-port.yml`, macOS arm64 runner, Xcode's compiler, native unit
-and PowerPC tests). It is in the ReXGlue patch series after 0103 (0104, 0105, and 0106 with the
-fixes from the first native build).
+and PowerPC tests). It is in the ReXGlue patch series after 0103 (0104, 0105, 0106 with the
+fixes from the first native build, and 0107 for 16 KB host pages).
 
 | Area | Change |
 | --- | --- |
@@ -148,18 +148,30 @@ Results on the Mac:
 | Test | Result |
 | --- | --- |
 | `rex_smoke --smoke_seconds=10` | **PASS**: SDL3 window, MoltenVK on the Apple GPU, Retina 2560x1440 at about 300 fps; guest memory reserved at `0x8000000000`, MMIO read and write traps fire (SIGBUS path) |
-| `unit_tests` | 191 cases: 6 to 10 fail, depending on the run, all in guest memory (see 16 KB pages below) |
+| `unit_tests` | 191 cases: 186 pass, 5 skipped, 0 fail (with 0107; before it, 6 to 10 failed in guest memory) |
 | `ppc_tests` | Does not build (see the PowerPC assembler below) |
+
+### 16 KB host pages (patch 0107)
+
+Apple silicon uses 16 KB pages, but most guest heaps use 4 KB pages. `mprotect` on a 4 KB-aligned
+address that is not 16 KB-aligned fails, so 4 KB `BaseHeap::Alloc` and `Protect` calls failed.
+Linux ARM64 under qemu used 4 KB pages, so step 1 did not show it.
+
+With 0107, when one host page holds several guest pages, the page table keeps the exact 4 KB
+protection (what the guest sees through `QueryProtect`, old-protection values and so on), and each
+host page gets the most permissive protection of the committed guest pages inside it. Alloc, Protect,
+Release (with `protect_on_release`), Save and Restore all go through this. Physical heaps keep
+write-watched host pages read-only, so committing a neighbouring guest page does not drop a GPU
+write watch. Heaps whose page size is at least the host page size (every heap on Windows and on
+4 KB-page Linux) are unchanged.
+
+The trade-off: a no-access or read-only 4 KB guest page that shares a 16 KB host page with a more
+accessible committed page does not fault on the host. That only matters for a game that relies on a
+4 KB guard page next to live data. The unit tests check protection bookkeeping and the recovery
+callback, not real hardware faults on such pages, so watch for this when booting the game.
 
 ### Known gaps
 
-- **16 KB host pages.** Apple silicon uses 16 KB pages, but the guest heaps allocate and protect
-  4 KB guest pages. `mmap`/`mprotect` on a 4 KB-aligned address that is not 16 KB-aligned fails, so
-  4 KB `BaseHeap::Alloc` and `Protect` calls fail (`heap_allocation_test.cpp`,
-  `access_violation_recovery_test.cpp`). Write-watch, MMIO and guest memory protection all work per
-  page, so the game will hit this. It needs a design decision, for example rounding host commits and
-  protections out to 16 KB and tracking 4 KB guest state separately. Linux ARM64 under qemu used
-  4 KB pages, so step 1 did not show it.
 - **PowerPC test assembler.** The instruction tests need `powerpc-none-elf-as` with the Xbox 360
   `-mvmx128` extension. The SDK's bundled build has it, but only for x86-64 Linux and Windows. Stock
   GNU binutils 2.42, which `PPC_BINUTILS_DIR` above and the CI job build, rejects `-mvmx128`, so
