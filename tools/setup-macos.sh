@@ -13,7 +13,8 @@
 # Env:
 #   BUILD_JOBS        parallel build jobs (default: number of performance cores)
 #   REXGLUE_URL       fork URL override
-#   REXGLUE_TESTS=1   also build the unit tests and PowerPC instruction tests; the latter need a
+#   REXGLUE_TESTS=1   also build the unit tests, the PowerPC instruction tests and rex_smoke (the
+#                     window/MoltenVK/guest-memory smoke test); the instruction tests need a
 #                     powerpc-none-elf binutils (as, ld, nm), found through PPC_BINUTILS_DIR
 #   PPC_BINUTILS_DIR  folder holding powerpc-none-elf-{as,ld,nm} (only with REXGLUE_TESTS=1)
 #   CONFIG            build configuration (default RelWithDebInfo)
@@ -89,7 +90,7 @@ REXGLUE_BIN="$SDK/out/macos-arm64/$CONFIG/rexglue"
 test -x "$REXGLUE_BIN" || { echo "ReXGlue binary was not produced: $REXGLUE_BIN" >&2; exit 1; }
 
 if [ "$REXGLUE_TESTS" = "1" ]; then
-  cmake --build "$BUILD_DIR" --config "$CONFIG" --target unit_tests ppc_tests -j "$BUILD_JOBS"
+  cmake --build "$BUILD_DIR" --config "$CONFIG" --target unit_tests ppc_tests rex_smoke -j "$BUILD_JOBS"
 fi
 
 echo "ReXGlue fetched, patched, built and installed for macOS: $SDK/out/install/macos-arm64"

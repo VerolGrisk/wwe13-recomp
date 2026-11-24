@@ -109,6 +109,23 @@ mkdir -p game && cp /path/to/your/WWE13/default.xex game/
 ./tools/build-macos.sh
 ```
 
+### Smoke test without game files
+
+`rex_smoke` (built with the tests) opens a window through the platform backend, presents with
+Vulkan (MoltenVK on Apple) and draws an ImGui overlay over a moving test pattern. It also reserves
+the real guest memory layout and triggers MMIO traps, the path that raises SIGBUS on Darwin. It
+shows window size, DPI, fullscreen state, frame rate and recent input events.
+
+```bash
+brew install molten-vk vulkan-loader
+REXGLUE_TESTS=1 PPC_BINUTILS_DIR=/path/to/ppc-binutils/bin ./tools/setup-macos.sh
+../tools/rexglue/out/build/macos-arm64/tests/bin/RelWithDebInfo/rex_smoke              # interactive
+../tools/rexglue/out/build/macos-arm64/tests/bin/RelWithDebInfo/rex_smoke --smoke_seconds=10  # prints PASS/FAIL
+```
+
+F or F11 toggles fullscreen, and Esc quits. A smooth sweeping bar and visible white borders on all four
+edges mean presentation and Retina scaling are right.
+
 ### Known gaps
 
 - Not yet built on a Mac: expect a first round of compile fixes from the CI job.

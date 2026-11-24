@@ -1,0 +1,548 @@
+From f14ce6c9b80100f9df61c8b37dce2a5a718a2043 Mon Sep 17 00:00:00 2001
+From: WWE13 Recomp <wwe13-recomp@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 00:01:49 +0000
+Subject: [PATCH] apple: never MAP_FIXED over a live mapping; rex_smoke
+ platform smoke test
+
+memory_posix (Darwin): Memory::MapViews first tries base 1<<32, where the
+arm64 main executable sits right above __PAGEZERO; MAP_FIXED would replace
+the running program's own code. MapFileView now refuses occupied fixed
+ranges on Darwin, and MapViews moves on to the next base.
+
+tests/smoke (rex_smoke): opens a window through the platform backend,
+presents with Vulkan (MoltenVK on Apple) and draws an ImGui overlay over a
+test pattern; initializes the real guest memory layout and checks that MMIO
+loads/stores trap into their callbacks (SIGBUS on Darwin). Shows size, DPI,
+fullscreen, fps and input events; --smoke_seconds=N prints PASS/FAIL and
+sets the exit code. Built with REXGLUE_BUILD_TESTS (Vulkan builds).
+---
+ src/core/memory_posix.cpp  |  10 +
+ tests/CMakeLists.txt       |   3 +
+ tests/smoke/CMakeLists.txt |  29 +++
+ tests/smoke/smoke_app.cpp  | 444 +++++++++++++++++++++++++++++++++++++
+ 4 files changed, 486 insertions(+)
+ create mode 100644 tests/smoke/CMakeLists.txt
+ create mode 100644 tests/smoke/smoke_app.cpp
+
+diff --git a/src/core/memory_posix.cpp b/src/core/memory_posix.cpp
+index 9138b02..9da80b4 100644
+--- a/src/core/memory_posix.cpp
++++ b/src/core/memory_posix.cpp
+@@ -502,6 +502,16 @@ void* MapFileView(FileMappingHandle handle, void* base_address, size_t length, P
+   // The emulator reserves address space first, then maps file views into it.
+   // MAP_FIXED_NOREPLACE would fail with EEXIST in this case.
+   if (base_address) {
++#if REX_PLATFORM_MAC
++    // On Apple silicon the main executable (and dyld's shared region) is mapped right above the
++    // 4 GB __PAGEZERO, where Memory::MapViews makes its first attempt: MAP_FIXED there would
++    // silently replace the running program's own code. Refuse occupied ranges instead; MapViews
++    // then tries the next base address.
++    if (IsRangePartlyMapped(base_address, length)) {
++      errno = EEXIST;
++      return nullptr;
++    }
++#endif
+     flags |= MAP_FIXED;
+   }
+ 
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+index 3e67044..55034bb 100644
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -4,5 +4,8 @@
+ # Unit tests for core components
+ add_subdirectory(unit)
+ 
++# Platform smoke test (opens a window; no game files needed)
++add_subdirectory(smoke)
++
+ # PPC instruction tests (requires PPC toolchain)
+ add_subdirectory(ppc)
+diff --git a/tests/smoke/CMakeLists.txt b/tests/smoke/CMakeLists.txt
+new file mode 100644
+index 0000000..0e73f62
+--- /dev/null
++++ b/tests/smoke/CMakeLists.txt
+@@ -0,0 +1,29 @@
++# rex_smoke: platform smoke test (window, presenter, ImGui, guest memory and MMIO traps) that needs
++# no game files. Built with the tests; run it on a desktop (it opens a window).
++if(NOT REXGLUE_USE_VULKAN)
++    return()
++endif()
++
++if(WIN32)
++    set(REX_SMOKE_MAIN ${PROJECT_SOURCE_DIR}/src/ui/windowed_app_main_win.cpp)
++elseif(APPLE)
++    set(REX_SMOKE_MAIN ${PROJECT_SOURCE_DIR}/src/ui/windowed_app_main_sdl.cpp)
++else()
++    set(REX_SMOKE_MAIN ${PROJECT_SOURCE_DIR}/src/ui/windowed_app_main_posix.cpp)
++endif()
++
++add_executable(rex_smoke smoke_app.cpp ${REX_SMOKE_MAIN})
++target_include_directories(rex_smoke PRIVATE ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/src)
++target_link_libraries(rex_smoke PRIVATE rexui rexcore rexkernel)
++if(NOT WIN32)
++    target_link_libraries(rex_smoke PRIVATE "$<LINK_GROUP:RESCAN,rexkernel,rexsystem>")
++else()
++    target_link_libraries(rex_smoke PRIVATE rexsystem)
++endif()
++if(UNIX AND NOT APPLE)
++    find_package(PkgConfig REQUIRED)
++    pkg_check_modules(SMOKE_GTK3 REQUIRED gtk+-3.0)
++    target_include_directories(rex_smoke PRIVATE ${SMOKE_GTK3_INCLUDE_DIRS})
++    target_link_libraries(rex_smoke PRIVATE ${SMOKE_GTK3_LIBRARIES})
++endif()
++set_target_properties(rex_smoke PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests/bin)
+diff --git a/tests/smoke/smoke_app.cpp b/tests/smoke/smoke_app.cpp
+new file mode 100644
+index 0000000..a32096a
+--- /dev/null
++++ b/tests/smoke/smoke_app.cpp
+@@ -0,0 +1,444 @@
++/**
++ * ReXGlue platform smoke test (rex_smoke).
++ *
++ * A small windowed app that exercises the parts of a port that need no game files:
++ *   - the guest memory layout (rex::memory::Memory::Initialize, the same ~4.5 GB file mapping and
++ *     views the game uses) and the MMIO trap path (a host load/store to a registered guest range
++ *     faults, the exception handler decodes the instruction and calls back);
++ *   - the platform window, the Vulkan presenter (MoltenVK on Apple) and ImGui drawing;
++ *   - window events: resize, DPI, fullscreen, focus, keyboard, text, mouse, wheel, touch.
++ *
++ * Keys: F or F11 toggles fullscreen, Esc quits. --smoke_seconds=N quits by itself after N seconds
++ * and prints a summary (exit code 0 only if every check passed and frames were presented).
++ */
++
++#include <atomic>
++#include <chrono>
++#include <cmath>
++#include <cstdio>
++#include <cstdlib>
++#include <deque>
++#include <memory>
++#include <string>
++
++#include <imgui.h>
++
++#include <rex/cvar.h>
++#include <rex/logging.h>
++#include <rex/platform.h>
++#include <rex/system/xmemory.h>
++#include <rex/ui/imgui_dialog.h>
++#include <rex/ui/imgui_drawer.h>
++#include <rex/ui/immediate_drawer.h>
++#include <rex/ui/presenter.h>
++#include <rex/ui/ui_event.h>
++#include <rex/ui/vulkan/provider.h>
++#include <rex/ui/window.h>
++#include <rex/ui/window_listener.h>
++#include <rex/ui/windowed_app.h>
++#include <rex/ui/windowed_app_context.h>
++
++REXCVAR_DEFINE_INT32(smoke_seconds, 0, "Smoke",
++                     "Quit after this many seconds and print a summary (0: run until closed)");
++
++namespace {
++
++using Clock = std::chrono::steady_clock;
++
++const char* PlatformName() {
++#if REX_PLATFORM_MAC
++#if defined(TARGET_OS_IOS) && TARGET_OS_IOS
++  return "iOS / iPadOS";
++#else
++  return "macOS";
++#endif
++#elif REX_PLATFORM_WIN32
++  return "Windows";
++#elif REX_PLATFORM_LINUX
++  return "Linux";
++#else
++  return "unknown";
++#endif
++}
++
++const char* ArchName() {
++#if REX_ARCH_ARM64
++  return "arm64";
++#elif REX_ARCH_AMD64
++  return "x86-64";
++#else
++  return "unknown";
++#endif
++}
++
++// --- guest memory + MMIO check ----------------------------------------------------------------
++
++struct MmioCounters {
++  std::atomic<uint32_t> reads{0};
++  std::atomic<uint32_t> writes{0};
++  std::atomic<uint32_t> last_write_address{0};
++  std::atomic<uint32_t> last_write_value{0};
++};
++
++uint32_t MmioRead(void* /*ppc_context*/, void* context, uint32_t address) {
++  auto* counters = static_cast<MmioCounters*>(context);
++  counters->reads.fetch_add(1);
++  return 0x12345678u ^ address;  // recognisable, address-dependent
++}
++
++void MmioWrite(void* /*ppc_context*/, void* context, uint32_t address, uint32_t value) {
++  auto* counters = static_cast<MmioCounters*>(context);
++  counters->writes.fetch_add(1);
++  counters->last_write_address = address;
++  counters->last_write_value = value;
++}
++
++struct MemoryCheck {
++  bool initialized = false;
++  bool plain_access_ok = false;
++  bool mmio_registered = false;
++  bool mmio_write_trapped = false;
++  bool mmio_read_trapped = false;
++  uintptr_t virtual_membase = 0;
++  std::string detail;
++
++  bool passed() const {
++    return initialized && plain_access_ok && mmio_registered && mmio_write_trapped &&
++           mmio_read_trapped;
++  }
++};
++
++// Guest GPU register block, registered the way GraphicsSystem does.
++constexpr uint32_t kMmioBase = 0x7FC80000;
++
++MemoryCheck RunMemoryCheck(rex::memory::Memory& memory, MmioCounters& counters) {
++  MemoryCheck check;
++  if (!memory.Initialize()) {
++    check.detail = "Memory::Initialize failed (guest address space could not be reserved)";
++    return check;
++  }
++  check.initialized = true;
++  check.virtual_membase = reinterpret_cast<uintptr_t>(memory.virtual_membase());
++
++  // Ordinary committed guest memory: the system heap allocates at startup; write through a view.
++  {
++    const uint32_t guest_address = memory.SystemHeapAlloc(4096);
++    if (guest_address) {
++      auto* p = memory.TranslateVirtual<volatile uint32_t*>(guest_address);
++      p[0] = 0xCAFEF00Du;
++      p[1] = 0x0BADBEEFu;
++      check.plain_access_ok = p[0] == 0xCAFEF00Du && p[1] == 0x0BADBEEFu;
++      memory.SystemHeapFree(guest_address);
++    }
++    if (!check.plain_access_ok) {
++      check.detail = "system heap allocation or access failed";
++    }
++  }
++
++  check.mmio_registered = memory.AddVirtualMappedRange(
++      kMmioBase, 0xFFFF0000, 0x0000FFFF, &counters, MmioRead, MmioWrite);
++  if (!check.mmio_registered) {
++    check.detail = "AddVirtualMappedRange failed";
++    return check;
++  }
++
++  // A host store and load to the inaccessible range must trap (SIGSEGV on Linux, SIGBUS on
++  // Darwin), be decoded and be turned into the callbacks above, then continue.
++  auto* reg = memory.TranslateVirtual<volatile uint32_t*>(kMmioBase + 0x10);
++  const uint32_t writes_before = counters.writes.load();
++  *reg = 0xA5A5A5A5u;
++  check.mmio_write_trapped = counters.writes.load() == writes_before + 1;
++  const uint32_t reads_before = counters.reads.load();
++  const uint32_t value = *reg;
++  (void)value;
++  check.mmio_read_trapped = counters.reads.load() == reads_before + 1;
++  if (!check.mmio_write_trapped || !check.mmio_read_trapped) {
++    check.detail = "MMIO access did not reach the callbacks";
++  }
++  return check;
++}
++
++// --- UI -----------------------------------------------------------------------------------------
++
++class SmokeApp;
++
++class SmokeDialog final : public rex::ui::ImGuiDialog {
++ public:
++  SmokeDialog(rex::ui::ImGuiDrawer* drawer, SmokeApp& app) : ImGuiDialog(drawer), app_(app) {}
++
++ protected:
++  void OnDraw(ImGuiIO& io) override;
++
++ private:
++  SmokeApp& app_;
++};
++
++class SmokeApp final : public rex::ui::WindowedApp,
++                       public rex::ui::WindowListener,
++                       public rex::ui::WindowInputListener {
++ public:
++  static std::unique_ptr<rex::ui::WindowedApp> Create(rex::ui::WindowedAppContext& ctx) {
++    return std::unique_ptr<rex::ui::WindowedApp>(new SmokeApp(ctx));
++  }
++
++  bool OnInitialize() override {
++    start_time_ = Clock::now();
++    std::printf("[smoke] %s %s\n", PlatformName(), ArchName());
++
++    memory_ = std::make_unique<rex::memory::Memory>();
++    memory_check_ = RunMemoryCheck(*memory_, mmio_counters_);
++    std::printf("[smoke] guest memory: %s (base %#llx)%s%s\n",
++                memory_check_.passed() ? "PASS" : "FAIL",
++                static_cast<unsigned long long>(memory_check_.virtual_membase),
++                memory_check_.detail.empty() ? "" : " - ", memory_check_.detail.c_str());
++
++    provider_ = rex::ui::vulkan::VulkanProvider::Create(false, true);
++    if (!provider_) {
++      std::fprintf(stderr, "[smoke] FAIL: no Vulkan device (on Apple: brew install molten-vk "
++                           "vulkan-loader)\n");
++      return false;
++    }
++
++    window_ = rex::ui::Window::Create(app_context(), "ReXGlue smoke test", 1280, 720);
++    if (!window_) {
++      std::fprintf(stderr, "[smoke] FAIL: Window::Create\n");
++      return false;
++    }
++    window_->AddListener(this);
++    window_->AddInputListener(this, 0);
++    if (!window_->Open()) {
++      std::fprintf(stderr, "[smoke] FAIL: Window::Open\n");
++      return false;
++    }
++
++    presenter_ = provider_->CreatePresenter();
++    immediate_drawer_ = provider_->CreateImmediateDrawer();
++    if (!presenter_ || !immediate_drawer_) {
++      std::fprintf(stderr, "[smoke] FAIL: presenter or immediate drawer\n");
++      return false;
++    }
++    immediate_drawer_->SetPresenter(presenter_.get());
++    imgui_drawer_ = std::make_unique<rex::ui::ImGuiDrawer>(window_.get(), 64);
++    imgui_drawer_->SetPresenterAndImmediateDrawer(presenter_.get(), immediate_drawer_.get());
++    dialog_ = std::make_unique<SmokeDialog>(imgui_drawer_.get(), *this);
++    window_->SetPresenter(presenter_.get());
++    presenter_->RequestUIPaintFromUIThread();
++    AddEvent("window opened");
++    return true;
++  }
++
++  void OnDestroy() override {
++    if (window_) {
++      window_->SetPresenter(nullptr);
++    }
++    dialog_.reset();
++    if (imgui_drawer_) {
++      imgui_drawer_->SetPresenterAndImmediateDrawer(nullptr, nullptr);
++      imgui_drawer_.reset();
++    }
++    if (immediate_drawer_) {
++      immediate_drawer_->SetPresenter(nullptr);
++      immediate_drawer_.reset();
++    }
++    presenter_.reset();
++    if (window_) {
++      window_->RemoveInputListener(this);
++      window_->RemoveListener(this);
++      window_.reset();
++    }
++    provider_.reset();
++    memory_.reset();
++    if (quit_requested_ && exit_code_ != EXIT_SUCCESS) {
++      // Automatic runs (--smoke_seconds) report failure through the exit code; the platform
++      // entry point otherwise returns success after a normal quit.
++      std::fflush(nullptr);
++      std::_Exit(exit_code_);
++    }
++  }
++
++  // Called from the dialog every frame.
++  void Draw(ImGuiIO& io) {
++    ++frames_;
++    const auto now = Clock::now();
++    frame_times_.push_back(now);
++    while (frame_times_.size() > 120) {
++      frame_times_.pop_front();
++    }
++    const double elapsed = std::chrono::duration<double>(now - start_time_).count();
++
++    DrawTestPattern(io, elapsed);
++
++    ImGui::SetNextWindowPos(ImVec2(16, 16), ImGuiCond_Always);
++    ImGui::SetNextWindowBgAlpha(0.85f);
++    ImGui::Begin("ReXGlue smoke test", nullptr,
++                 ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoMove |
++                     ImGuiWindowFlags_NoCollapse);
++    ImGui::Text("Platform: %s %s", PlatformName(), ArchName());
++    ImGui::Text("Window: %u x %u px, %u dpi, %s", window_->GetActualPhysicalWidth(),
++                window_->GetActualPhysicalHeight(), window_->GetDpi(),
++                window_->IsFullscreen() ? "fullscreen" : "windowed");
++    ImGui::Text("Frames: %llu   %.1f fps   (%.0f s)", static_cast<unsigned long long>(frames_),
++                Fps(), elapsed);
++    ImGui::Separator();
++    ImGui::Text("Guest memory: %s", memory_check_.passed() ? "PASS" : "FAIL");
++    ImGui::Text("  reserve %s, access %s, MMIO write %s, MMIO read %s",
++                memory_check_.initialized ? "ok" : "FAIL",
++                memory_check_.plain_access_ok ? "ok" : "FAIL",
++                memory_check_.mmio_write_trapped ? "ok" : "FAIL",
++                memory_check_.mmio_read_trapped ? "ok" : "FAIL");
++    if (!memory_check_.detail.empty()) {
++      ImGui::TextWrapped("  %s", memory_check_.detail.c_str());
++    }
++    ImGui::Separator();
++    ImGui::TextUnformatted("Recent input and window events:");
++    for (const std::string& event : events_) {
++      ImGui::BulletText("%s", event.c_str());
++    }
++    ImGui::Separator();
++    ImGui::TextUnformatted("F / F11: fullscreen   Esc: quit   Type, click, scroll or touch.");
++    ImGui::End();
++
++    if (REXCVAR_GET(smoke_seconds) > 0 && elapsed >= REXCVAR_GET(smoke_seconds) &&
++        !quit_requested_) {
++      quit_requested_ = true;
++      PrintSummary(elapsed);
++      app_context().QuitFromUIThread();
++      return;
++    }
++    // Keep painting (paced by the swapchain's vsync).
++    presenter_->RequestUIPaintFromUIThread();
++  }
++
++  bool all_passed() const { return memory_check_.passed() && frames_ > 10; }
++
++  // WindowListener
++  void OnClosing(rex::ui::UIEvent&) override { app_context().QuitFromUIThread(); }
++  void OnResize(rex::ui::UISetupEvent&) override {
++    AddEvent("resize " + std::to_string(window_->GetActualPhysicalWidth()) + "x" +
++             std::to_string(window_->GetActualPhysicalHeight()));
++  }
++  void OnDpiChanged(rex::ui::UISetupEvent&) override {
++    AddEvent("dpi " + std::to_string(window_->GetDpi()));
++  }
++  void OnGotFocus(rex::ui::UISetupEvent&) override { AddEvent("focus gained"); }
++  void OnLostFocus(rex::ui::UISetupEvent&) override { AddEvent("focus lost"); }
++  void OnFileDrop(rex::ui::FileDropEvent& e) override {
++    AddEvent("file dropped: " + e.filename().filename().string());
++  }
++
++  // WindowInputListener
++  void OnKeyDown(rex::ui::KeyEvent& e) override {
++    const auto key = e.virtual_key();
++    AddEvent("key down 0x" + Hex(uint32_t(key)) + (e.prev_state() ? " (repeat)" : ""));
++    if (key == rex::ui::VirtualKey::kEscape) {
++      app_context().QuitFromUIThread();
++    } else if ((key == rex::ui::VirtualKey::kF || key == rex::ui::VirtualKey::kF11) &&
++               !e.prev_state()) {
++      window_->SetFullscreen(!window_->IsFullscreen());
++    }
++  }
++  void OnKeyChar(rex::ui::KeyEvent& e) override {
++    const uint32_t c = uint32_t(e.virtual_key());
++    if (c >= 0x20 && c < 0x7F) {
++      AddEvent(std::string("text '") + char(c) + "'");
++    } else {
++      AddEvent("text U+" + Hex(c));
++    }
++  }
++  void OnMouseDown(rex::ui::MouseEvent& e) override {
++    AddEvent("mouse button " + std::to_string(int(e.button())) + " at " + std::to_string(e.x()) +
++             "," + std::to_string(e.y()));
++  }
++  void OnMouseWheel(rex::ui::MouseEvent& e) override {
++    AddEvent("wheel " + std::to_string(e.scroll_x()) + "," + std::to_string(e.scroll_y()));
++  }
++  void OnTouchEvent(rex::ui::TouchEvent& e) override {
++    static const char* kActions[] = {"down", "up", "cancel", "move"};
++    if (e.action() != rex::ui::TouchEvent::Action::kMove) {
++      AddEvent(std::string("touch ") + kActions[int(e.action())] + " at " +
++               std::to_string(int(e.x())) + "," + std::to_string(int(e.y())));
++    }
++  }
++
++ private:
++  explicit SmokeApp(rex::ui::WindowedAppContext& ctx) : WindowedApp(ctx, "rex_smoke") {}
++
++  static std::string Hex(uint32_t value) {
++    char text[16];
++    std::snprintf(text, sizeof(text), "%X", value);
++    return text;
++  }
++
++  void AddEvent(std::string text) {
++    events_.push_front(std::move(text));
++    while (events_.size() > 8) {
++      events_.pop_back();
++    }
++  }
++
++  double Fps() const {
++    if (frame_times_.size() < 2) {
++      return 0.0;
++    }
++    const double span =
++        std::chrono::duration<double>(frame_times_.back() - frame_times_.front()).count();
++    return span > 0.0 ? double(frame_times_.size() - 1) / span : 0.0;
++  }
++
++  // Moving colour bars across the whole window: smooth motion means presentation is paced; a
++  // stretched or offset picture means the swapchain size or Retina scale is wrong.
++  void DrawTestPattern(ImGuiIO& io, double elapsed) {
++    ImDrawList* draw = ImGui::GetBackgroundDrawList();
++    const float w = io.DisplaySize.x;
++    const float h = io.DisplaySize.y;
++    static const ImU32 kBars[] = {IM_COL32(191, 191, 191, 255), IM_COL32(191, 191, 0, 255),
++                                  IM_COL32(0, 191, 191, 255),   IM_COL32(0, 191, 0, 255),
++                                  IM_COL32(191, 0, 191, 255),   IM_COL32(191, 0, 0, 255),
++                                  IM_COL32(0, 0, 191, 255)};
++    const int bar_count = int(sizeof(kBars) / sizeof(kBars[0]));
++    for (int i = 0; i < bar_count; ++i) {
++      draw->AddRectFilled(ImVec2(w * i / bar_count, 0), ImVec2(w * (i + 1) / bar_count, h * 0.75f),
++                          kBars[i]);
++    }
++    draw->AddRectFilled(ImVec2(0, h * 0.75f), ImVec2(w, h), IM_COL32(16, 16, 16, 255));
++    // One-pixel border: all four edges must be visible.
++    draw->AddRect(ImVec2(0.5f, 0.5f), ImVec2(w - 0.5f, h - 0.5f), IM_COL32(255, 255, 255, 255));
++    // Sweeping bar, one screen width every 2 seconds.
++    const float x = float(std::fmod(elapsed * 0.5, 1.0)) * w;
++    draw->AddRectFilled(ImVec2(x, h * 0.75f), ImVec2(x + 24.0f, h), IM_COL32(255, 255, 255, 255));
++  }
++
++  void PrintSummary(double elapsed) {
++    std::printf("[smoke] window %ux%u, %u dpi\n", window_->GetActualPhysicalWidth(),
++                window_->GetActualPhysicalHeight(), window_->GetDpi());
++    std::printf("[smoke] presented %llu frames in %.1f s (%.1f fps recent)\n",
++                static_cast<unsigned long long>(frames_), elapsed, Fps());
++    std::printf("[smoke] result: %s\n", all_passed() ? "PASS" : "FAIL");
++    std::fflush(stdout);
++    exit_code_ = all_passed() ? EXIT_SUCCESS : EXIT_FAILURE;
++  }
++
++  Clock::time_point start_time_;
++  std::unique_ptr<rex::memory::Memory> memory_;
++  MmioCounters mmio_counters_;
++  MemoryCheck memory_check_;
++  std::unique_ptr<rex::ui::GraphicsProvider> provider_;
++  std::unique_ptr<rex::ui::Window> window_;
++  std::unique_ptr<rex::ui::Presenter> presenter_;
++  std::unique_ptr<rex::ui::ImmediateDrawer> immediate_drawer_;
++  std::unique_ptr<rex::ui::ImGuiDrawer> imgui_drawer_;
++  std::unique_ptr<SmokeDialog> dialog_;
++  std::deque<std::string> events_;
++  std::deque<Clock::time_point> frame_times_;
++  uint64_t frames_ = 0;
++  bool quit_requested_ = false;
++  int exit_code_ = EXIT_SUCCESS;
++};
++
++void SmokeDialog::OnDraw(ImGuiIO& io) {
++  app_.Draw(io);
++}
++
++}  // namespace
++
++REX_DEFINE_APP(rex_smoke, SmokeApp::Create);
+-- 
+2.43.0
+
