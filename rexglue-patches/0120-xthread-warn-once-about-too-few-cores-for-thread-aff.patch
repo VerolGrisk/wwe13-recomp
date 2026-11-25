@@ -1,0 +1,36 @@
+From 99764cd2e834c62ead500434b1d8d0d998b0dc96 Mon Sep 17 00:00:00 2001
+From: WWE13 Recomp <wwe13-recomp@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 04:37:58 -0500
+Subject: [PATCH 120/120] xthread: warn once about too few cores for thread
+ affinities
+
+SetActiveCpu runs every time a game moves a thread between CPUs; on a 5-core iPad
+the warning was logged about 250 times a second (29,700 lines in two minutes).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/system/xthread.cpp | 8 +++++++-
+ 1 file changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/src/system/xthread.cpp b/src/system/xthread.cpp
+index 1f82ba3..63c539f 100644
+--- a/src/system/xthread.cpp
++++ b/src/system/xthread.cpp
+@@ -923,7 +923,13 @@ void XThread::SetActiveCpu(uint8_t cpu_index) {
+       thread_->set_affinity_mask(uint64_t(1) << cpu_index);
+     }
+   } else {
+-    REXSYS_WARN("Too few processor cores - scheduling will be wonky");
++    // Games move threads between CPUs many times a second; say it once, not on every move (an
++    // iPad logged this ~250 times a second, the main source of log writes during play).
++    static std::atomic_flag warned = ATOMIC_FLAG_INIT;
++    if (!warned.test_and_set(std::memory_order_relaxed)) {
++      REXSYS_WARN("Too few processor cores ({}) for the guest's 6 hardware threads: thread "
++                  "affinities are ignored", rex::thread::logical_processor_count());
++    }
+   }
+ }
+ 
+-- 
+2.54.0 (Apple Git-157)
+

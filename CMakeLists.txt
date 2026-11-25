@@ -84,3 +84,27 @@ if(WIN32)
   # Link map next to the exe: symbol -> object resolution for Windows-only link checks.
   target_link_options(wwe13 PRIVATE "LINKER:/map:$<TARGET_FILE_DIR:wwe13>/wwe13.map")
 endif()
+if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
+  # iOS / iPadOS: an app bundle with the game's Info.plist (landscape, full screen, Documents in
+  # the Files app) and MoltenVK embedded (iOS has no Vulkan loader). tools/build-ios.sh signs it
+  # ad-hoc with cmake/ios/app.entitlements and packages the IPA.
+  set(WWE13_IOS_MOLTENVK_FRAMEWORK "" CACHE PATH "ios-arm64 MoltenVK.framework to embed")
+  set_target_properties(wwe13 PROPERTIES
+    MACOSX_BUNDLE TRUE
+    MACOSX_BUNDLE_INFO_PLIST "${CMAKE_CURRENT_SOURCE_DIR}/cmake/ios/Info.plist.in"
+    MACOSX_BUNDLE_GUI_IDENTIFIER "com.wwe13recomp.game"
+    MACOSX_BUNDLE_BUNDLE_NAME "WWE 13"
+    MACOSX_BUNDLE_SHORT_VERSION_STRING "1.0"
+    MACOSX_BUNDLE_BUNDLE_VERSION "1"
+    BUILD_WITH_INSTALL_RPATH TRUE
+    INSTALL_RPATH "@executable_path/Frameworks")
+  if(WWE13_IOS_MOLTENVK_FRAMEWORK)
+    add_custom_command(TARGET wwe13 POST_BUILD
+      COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_BUNDLE_DIR:wwe13>/Frameworks"
+      COMMAND ${CMAKE_COMMAND} -E copy_directory "${WWE13_IOS_MOLTENVK_FRAMEWORK}"
+              "$<TARGET_BUNDLE_DIR:wwe13>/Frameworks/MoltenVK.framework"
+      VERBATIM)
+  else()
+    message(WARNING "WWE13_IOS_MOLTENVK_FRAMEWORK is not set: the app will find no Vulkan driver")
+  endif()
+endif()

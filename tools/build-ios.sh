@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# tools/build-ios.sh: build the ReXGlue smoke test (rex_smoke) as an iOS / iPadOS app and package it
+# tools/build-ios.sh [smoke|game]: build the ReXGlue smoke test (rex_smoke, the default) or the game
+# (WWE 13, after ./tools/codegen.sh on the Mac) as an iOS / iPadOS app and package it
 # as an unsigned-for-distribution IPA (ad-hoc signed, with the entitlements the game needs) for a
 # signing service such as Signulous, or for Xcode/devicectl installs.
 #
@@ -17,6 +18,8 @@
 #   CONFIG               RelWithDebInfo (default) or Release
 set -euo pipefail
 
+WHAT=${1:-smoke}
+case "$WHAT" in smoke|game) ;; *) echo "Usage: $0 [smoke|game]" >&2; exit 2 ;; esac
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 SDK="$ROOT/../tools/rexglue"
 TOOLS="$ROOT/../tools"
@@ -83,24 +86,38 @@ cmake -S "$SDK" -B "$BUILD_DIR" -G Ninja \
   -DREXGLUE_IOS_MOLTENVK_FRAMEWORK="$MVK_FRAMEWORK"
 ninja_args=(-j "$BUILD_JOBS")
 [ "${KEEP_GOING:-0}" = "1" ] && ninja_args+=(-k 0)
-cmake --build "$BUILD_DIR" --target rex_smoke -- "${ninja_args[@]}"
 
-APP=$(find "$BUILD_DIR" -name "rex_smoke.app" -type d -maxdepth 5 | head -1)
-test -d "$APP" || { echo "rex_smoke.app was not produced" >&2; exit 1; }
+if [ "$WHAT" = smoke ]; then
+  cmake --build "$BUILD_DIR" --target rex_smoke -- "${ninja_args[@]}"
+  APP=$(find "$BUILD_DIR" -name "rex_smoke.app" -type d -maxdepth 5 | head -1)
+  IPA_NAME=ReXSmoke.ipa
+  APP_LABEL="ReX Smoke"
+else
+  # The game links the SDK installed for iOS; the recompiled sources come from the host codegen.
+  test -f "$ROOT/generated/sources.cmake" || { echo "Run ./tools/codegen.sh on the Mac first." >&2; exit 1; }
+  cmake --build "$BUILD_DIR" --target install -- "${ninja_args[@]}"
+  GAME_BUILD="$ROOT/out/build/ios-arm64-relwithdebinfo"
+  cmake --preset ios-arm64-relwithdebinfo -S "$ROOT" -DWWE13_IOS_MOLTENVK_FRAMEWORK="$MVK_FRAMEWORK"
+  cmake --build "$GAME_BUILD" -- "${ninja_args[@]}"
+  APP="$GAME_BUILD/wwe13.app"
+  IPA_NAME=WWE13.ipa
+  APP_LABEL="WWE 13"
+fi
+test -d "$APP" || { echo "The $WHAT app was not produced" >&2; exit 1; }
 
 # --- Sign (ad-hoc, with the entitlements) and package --------------------------------------------
 # A signing service re-signs with its own certificate; the ad-hoc signature carries the entitlement
 # requests so they are visible to it. Frameworks are signed before the app.
 codesign --force --sign - --timestamp=none "$APP/Frameworks/MoltenVK.framework"
-codesign --force --sign - --timestamp=none --entitlements "$SDK/cmake/ios/app.entitlements" "$APP"
+codesign --force --sign - --timestamp=none --entitlements "$ROOT/cmake/ios/app.entitlements" "$APP"
 
 OUT="$ROOT/out/ios"
 rm -rf "$OUT/Payload"
 mkdir -p "$OUT/Payload"
 cp -R "$APP" "$OUT/Payload/"
-( cd "$OUT" && rm -f ReXSmoke.ipa && zip -qry ReXSmoke.ipa Payload )
+( cd "$OUT" && rm -f "$IPA_NAME" && zip -qry "$IPA_NAME" Payload )
 rm -rf "$OUT/Payload"
 echo
-echo "Built $OUT/ReXSmoke.ipa"
+echo "Built $OUT/$IPA_NAME"
 echo "Sign it with your signing service and install it. Logs go to the app's Documents folder"
-echo "(Files app > On My iPad > ReX Smoke)."
+echo "(Files app > On My iPad > $APP_LABEL)."

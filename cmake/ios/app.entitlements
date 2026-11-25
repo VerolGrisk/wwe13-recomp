@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Entitlements a ReXGlue game needs on iOS. The guest address space alone is a ~4.5 GB contiguous
+  reservation, so the app asks for the extended virtual address space and the raised memory limit.
+  A signing service may drop entitlements its certificate does not allow; the smoke test reports
+  what the app actually got.
+-->
+<plist version="1.0">
+<dict>
+  <key>com.apple.developer.kernel.extended-virtual-addressing</key>
+  <true/>
+  <key>com.apple.developer.kernel.increased-memory-limit</key>
+  <true/>
+</dict>
+</plist>

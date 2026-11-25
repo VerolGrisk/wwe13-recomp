@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <memory>
 #include <mutex>
 #include <string_view>
@@ -17,6 +18,12 @@
 
 #if !defined(_WIN32) && !defined(__APPLE__)
 #include <gtk/gtk.h>
+#endif
+#if defined(__APPLE__)
+#include <TargetConditionals.h>
+#endif
+#if defined(TARGET_OS_IOS) && TARGET_OS_IOS
+#include <SDL3/SDL_filesystem.h>
 #endif
 
 #include <rex/cvar.h>
@@ -59,6 +66,21 @@ class Wwe13App : public rex::ReXApp {
   std::string_view GetWindowTitle() const override { return "WWE 13"; }
 
   void OnConfigurePaths(rex::PathConfig& paths) override {
+#if defined(TARGET_OS_IOS) && TARGET_OS_IOS
+    // iOS / iPadOS: no launcher and no command line. The game folder ("WWE 13", the extracted
+    // disc with title update 2.0.1.0) and the user data (saves, settings, shader cache) live in
+    // the app's Documents folder, which the Files app shows as On My iPad > WWE 13 (the app bundle
+    // itself is read-only).
+    if (const char* documents = SDL_GetUserFolder(SDL_FOLDER_DOCUMENTS)) {
+      const std::filesystem::path documents_path(documents);
+      if (!GetArgument("game_directory")) {
+        paths.game_data_root = documents_path / "WWE 13";
+      }
+      paths.user_data_root = documents_path / "userdata";
+      std::error_code ec;
+      std::filesystem::create_directories(paths.user_data_root, ec);
+    }
+#endif
     game_data_root_ = paths.game_data_root;
     user_data_root_ = paths.user_data_root;
     game_file_check_result_ = wwe13::CheckSupportedGameFiles(paths.game_data_root);

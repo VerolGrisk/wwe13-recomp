@@ -340,6 +340,35 @@ needs a contiguous ~4.5 GB block, so if the signing service dropped the extended
 addressing entitlement, this range is small and **Guest memory** fails. Logs are in the app's
 Documents folder (Files app > On My iPad > ReX Smoke).
 
+### The game on iOS (patches 0119–0120)
+
+**A full match plays on the iPad mini** (controller, sound), from the same codegen output as the
+Mac build.
+
+```bash
+./tools/codegen.sh            # on the Mac, once (generates the recompiled sources)
+./tools/build-ios.sh game     # installs the SDK for iOS, builds the game -> out/ios/WWE13.ipa
+```
+
+- Preset `ios-arm64-relwithdebinfo` (Ninja, `cmake/toolchains/ios-arm64.cmake`, SDK from
+  `../tools/rexglue/out/install/ios-arm64`). The game is an app bundle with its own
+  `cmake/ios/Info.plist.in` and `cmake/ios/app.entitlements`; MoltenVK is embedded in `Frameworks/`.
+- Patch 0119: the rendered `generated/rexglue.cmake` only defines the codegen target when the SDK
+  has the host `rexglue` tool (an SDK installed for iOS has none).
+- No launcher and no command line on iOS: the game folder is `Documents/WWE 13` and user data
+  (saves, settings, shader cache) is `Documents/userdata`. In the Files app that is
+  On My iPad > WWE 13 > WWE 13 (copy the extracted disc with title update 2.0.1.0 there; Finder's
+  iPad > Files tab is the faster way for ~7 GB). The log is `wwe13.log` in the same folder.
+- Patch 0120: the iPad reports 5 cores, fewer than the guest's 6 hardware threads, so thread
+  affinities are ignored; the warning about it is logged once instead of on every CPU move
+  (it was ~250 lines a second).
+
+First performance numbers (from the `[wwe13-flip]` lines): menus run at 52–53 fps. In an entrance
+the game switches itself to 30 fps but the iPad reaches only **13–24 fps for the whole entrance**,
+with almost every flip late. Pipeline creation is not the cause (364 pipelines, nearly all in one
+burst before the entrance, none afterwards while it stays slow), so it is sustained CPU or GPU
+throughput; which one is the next thing to measure.
+
 ## Planned next steps
 
 - **Step 2 – macOS (Apple Silicon):** add the Apple platform to the SDK build, port items 2–4 for Darwin, and
