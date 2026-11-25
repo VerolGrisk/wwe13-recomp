@@ -87,7 +87,7 @@ Code for the Apple platform, written without a Mac and checked by the **macOS po
 workflow (`.github/workflows/macos-port.yml`, macOS arm64 runner, Xcode's compiler, native unit
 and PowerPC tests). It is in the ReXGlue patch series after 0103 (0104, 0105, 0106 with the
 fixes from the first native build, 0107 for 16 KB host pages, 0108 for function aliases, and
-0109–0115 from the first game boot).
+0109–0115 from the first game boot, 0116 and 0118 for iOS, and 0117 for ARM64 memory barriers).
 
 | Area | Change |
 | --- | --- |
@@ -264,16 +264,51 @@ Not problems, though they look like them in the log:
 - Freeze reports on Apple have no host backtraces, per-thread CPU time or thread state.
 - No `.app` bundle yet (the launcher is started from Terminal or Finder as a plain executable), and
   the launcher is not built in CI.
-- iOS: `shm_open` is not allowed in the app sandbox, so guest memory needs Mach memory entries
-  (`mach_make_memory_entry_64` + `vm_map`), and the ~8 GB layout needs the extended virtual
-  addressing entitlement.
+- **Intermittent GPU command-stream corruption.** Twice, when a new scene started (many new Metal
+  pipelines), the command processor read garbage from the primary ring buffer
+  ("PRIMARY RINGBUFFER: Failed to execute packet") and the game froze. The read pointer is written
+  back only after a batch, and 0117's barriers did not stop it; it did not reproduce in the next
+  six runs. Not understood yet.
+- Building new Metal pipelines stalls the GPU thread (median about 150 ms, up to about 900 ms each),
+  so new scenes stutter the first time they are seen.
+- `tools/build-macos.sh` removes the old binaries before copying: overwriting a signed arm64
+  binary in place (same inode) makes macOS kill the new one at launch (exit 137).
+
+### Memory barriers on ARM64 (patch 0117)
+
+The recompiler emitted nothing for PowerPC `sync` / `lwsync` / `eieio` (no-ops on x86, which keeps
+stores in order). ARM64 may reorder stores, so another core could see a "ready" flag or a ring-buffer
+write pointer before the data it publishes. They are now `std::atomic_thread_fence` on ARM64 and
+still nothing on x86 (`PPC_SYNC` / `PPC_LWSYNC` / `PPC_EIEIO` in `rex/ppc/memory.h`); a codegen
+run puts 316 of them in the game.
 
 ## Step 3 – iOS / iPadOS (in progress)
 
 First milestone: **`rex_smoke` as an iPad app**, signed by a signing service and installed on the
 device. It checks the window, MoltenVK on the iPad GPU, the guest memory layout (on iOS backed by a
 Mach memory entry), MMIO traps, fibers, and how much address space and memory iOS gives the app.
-No game files are needed. Code in ReXGlue patch 0116; scripts in this repository.
+No game files are needed. Code in ReXGlue patches 0116 and 0118; scripts in this repository.
+
+Result on an iPad mini (iPadOS, arm64, 12 GB), installed with a signing service:
+
+| Check | Result |
+| --- | --- |
+| MoltenVK window | 60 fps, landscape 2316 x 1512, touch |
+| Guest memory | PASS: reserve, access, MMIO write and read traps |
+| 8 GB address reservation (anywhere) | ok (extended virtual addressing) |
+| Memory available to the app | about 12,270 MB (increased memory limit) |
+| `shm_open` | refused by the sandbox ("Operation not permitted"), hence the Mach memory entry |
+
+Patch 0118 fixes what that testing found:
+
+- **Placement:** iOS refused every fixed base `Memory::Initialize` tried (`1<<32` to `1<<40`; the
+  low ones hold the app and the shared cache, the high ones are beyond the app's address space).
+  On iOS it now reserves the span plus 4 GB anywhere and maps the views at the 4 GB-aligned base
+  inside, with the fixed bases kept as the fallback.
+- **Window size:** with a Metal view, SDL reports the layer's stale drawable size after a rotation,
+  so window size, surface size and touch scaling use points times pixel density.
+- **Orientation:** landscape is forced (`SDL_HINT_ORIENTATIONS`), because SDL settled on portrait.
+- **Build stamp:** the overlay shows when the app was built, to tell builds apart on the device.
 
 | Area | Change |
 | --- | --- |

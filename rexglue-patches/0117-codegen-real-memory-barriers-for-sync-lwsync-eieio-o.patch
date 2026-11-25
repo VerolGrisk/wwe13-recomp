@@ -1,0 +1,93 @@
+From 9212547c0f8ff74f99df5e592642392d75f1c301 Mon Sep 17 00:00:00 2001
+From: WWE13 Recomp <wwe13-recomp@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 20:06:15 -0500
+Subject: [PATCH 117/118] codegen: real memory barriers for sync/lwsync/eieio
+ on ARM64
+
+The recompiler emitted nothing for the PowerPC barriers ("x86 has strong
+ordering so this is a no-op"). That holds on x86 (TSO) but not on ARM64,
+which may reorder stores: another core can see a later store (a ready
+flag, a ring-buffer write pointer) before the data it publishes. Guest
+code (Direct3D command buffers, lock-free queues) relies on these
+barriers between threads.
+
+Codegen now emits PPC_SYNC() / PPC_LWSYNC() / PPC_EIEIO() (rex/ppc/memory.h):
+std::atomic_thread_fence (dmb ish) on ARM64, nothing on x86. lwarx/stwcx.
+already use __sync builtins, which are full barriers.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ include/rex/ppc/memory.h        | 18 ++++++++++++++++++
+ src/codegen/builders/system.cpp | 12 ++++++------
+ 2 files changed, 24 insertions(+), 6 deletions(-)
+
+diff --git a/include/rex/ppc/memory.h b/include/rex/ppc/memory.h
+index 029d879..4079193 100644
+--- a/include/rex/ppc/memory.h
++++ b/include/rex/ppc/memory.h
+@@ -15,6 +15,7 @@
+ #pragma once
+ 
+ #include <array>
++#include <atomic>
+ #include <climits>
+ #include <cmath>
+ #include <cstdint>
+@@ -45,6 +46,23 @@
+ // Apple silicon has 16 KB pages, so it takes the same path as Windows (the kernel heap's
+ // host_address_offset is 0x1000 whenever allocation granularity exceeds 4 KB; Memory checks at
+ // startup that the two agree). Intel Macs have 4 KB pages, like Linux.
++//=============================================================================
++// PowerPC memory barriers (sync, lwsync, eieio)
++//=============================================================================
++// Guest code publishes data between threads (and to the GPU) with these. x86 is strongly ordered
++// (TSO), so they need no instruction there. ARM64 is weakly ordered: without a fence another core
++// can observe a later store (a "ready" flag, a ring-buffer write pointer) before the data it
++// publishes, so they become dmb ish (std::atomic_thread_fence).
++#if defined(__aarch64__) || defined(_M_ARM64)
++#define PPC_SYNC() std::atomic_thread_fence(std::memory_order_seq_cst)
++#define PPC_LWSYNC() std::atomic_thread_fence(std::memory_order_acq_rel)
++#define PPC_EIEIO() std::atomic_thread_fence(std::memory_order_seq_cst)
++#else
++#define PPC_SYNC() ((void)0)
++#define PPC_LWSYNC() ((void)0)
++#define PPC_EIEIO() ((void)0)
++#endif
++
+ #if REX_PLATFORM_WIN32 || (REX_PLATFORM_MAC && defined(__aarch64__))
+ #define REX_PHYS_HEAP_HOST_OFFSET 1
+ #define PPC_PHYS_HOST_OFFSET(addr) (((uint32_t)(addr) >= 0xE0000000u) ? 0x1000u : 0u)
+diff --git a/src/codegen/builders/system.cpp b/src/codegen/builders/system.cpp
+index 9cd26e4..afead27 100644
+--- a/src/codegen/builders/system.cpp
++++ b/src/codegen/builders/system.cpp
+@@ -31,20 +31,20 @@ bool build_attn(BuilderContext& ctx) {
+ }
+ 
+ bool build_sync(BuilderContext& ctx) {
+-  // Memory barrier, x86 has strong ordering so this is a no-op
+-  (void)ctx;
++  // Memory barrier: a no-op on x86 (strong ordering), a fence on ARM64 (rex/ppc/memory.h).
++  ctx.println("\tPPC_SYNC();");
+   return true;
+ }
+ 
+ bool build_lwsync(BuilderContext& ctx) {
+-  // Lightweight memory barrier, x86 has strong ordering so this is a no-op
+-  (void)ctx;
++  // Lightweight memory barrier: a no-op on x86 (strong ordering), a fence on ARM64 (rex/ppc/memory.h).
++  ctx.println("\tPPC_LWSYNC();");
+   return true;
+ }
+ 
+ bool build_eieio(BuilderContext& ctx) {
+-  // Enforce in-order execution of I/O, x86 has strong ordering so this is a no-op
+-  (void)ctx;
++  // Enforce in-order execution of I/O: a no-op on x86 (strong ordering), a fence on ARM64 (rex/ppc/memory.h).
++  ctx.println("\tPPC_EIEIO();");
+   return true;
+ }
+ 
+-- 
+2.54.0 (Apple Git-157)
+

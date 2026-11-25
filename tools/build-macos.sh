@@ -29,8 +29,13 @@ cmake --build "$LAUNCHER_BUILD" --target wwe13-launcher
 # Assemble: launcher, game and the FFmpeg libraries under the names the game loads (@rpath).
 OUT="$ROOT/out/macos-arm64"
 mkdir -p "$OUT"
-cp -f "$LAUNCHER_BUILD/wwe13-launcher" "$GAME_DIR/wwe13" "$OUT/"
-cp -f "$GAME_DIR"/libavcodec.58.dylib "$GAME_DIR"/libavutil.56.dylib "$OUT/"
+# Remove before copying: overwriting a signed arm64 binary in place (same inode) makes the kernel
+# kill the new one at launch (SIGKILL, exit 137), because it keeps the old code-signature data.
+for file in wwe13-launcher wwe13 libavcodec.58.dylib libavutil.56.dylib; do
+  rm -f "$OUT/$file"
+done
+cp "$LAUNCHER_BUILD/wwe13-launcher" "$GAME_DIR/wwe13" "$OUT/"
+cp "$GAME_DIR"/libavcodec.58.dylib "$GAME_DIR"/libavutil.56.dylib "$OUT/"
 echo "Built: $OUT"
 echo "  Start the launcher: \"$OUT/wwe13-launcher\" (Play starts ./wwe13 from the same folder)."
 echo "  Put the game folder at \"$OUT/WWE 13\", or choose it on the launcher's Game files page."

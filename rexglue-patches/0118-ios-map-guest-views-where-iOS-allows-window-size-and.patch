@@ -1,0 +1,214 @@
+From 8fdd60096e6b5b2fad7993864c65ae527058e71d Mon Sep 17 00:00:00 2001
+From: WWE13 Recomp <wwe13-recomp@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 20:08:19 -0500
+Subject: [PATCH 118/118] ios: map guest views where iOS allows; window size
+ and orientation
+
+Follow-up to the iOS build patch, from testing rex_smoke on an iPad mini
+(iPadOS, arm64, 12 GB):
+
+- Memory::Initialize: iOS refused every fixed base it tried
+  (1<<32 .. 1<<40: the low ones hold the app and the shared cache, the
+  high ones are beyond the app's address space), so Initialize failed
+  even with the Mach memory entry. On iOS it now reserves the guest span
+  plus 4 GB anywhere, takes the 4 GB-aligned base inside, releases the
+  reservation and maps the views there; the fixed bases stay as the
+  fallback. With it: guest memory reserve/access and MMIO read/write
+  traps PASS on the iPad.
+- Window size: with a Metal view, SDL_GetWindowSizeInPixels reports the
+  layer's drawableSize on iOS, which keeps the old orientation after a
+  rotation; window size, surface size and touch scaling now use points
+  x pixel density (GetSDLWindowPixelSize).
+- Orientation: SDL's view controller settled on portrait; force
+  landscape (SDL_HINT_ORIENTATIONS), as the app's Info.plist says.
+- rex_smoke shows a build stamp, to tell builds apart on a device.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ include/rex/ui/surface_apple.h |  5 ++++
+ src/system/xmemory.cpp         | 43 +++++++++++++++++++++++++++++++++-
+ src/ui/surface_apple.cpp       | 21 ++++++++++++++++-
+ src/ui/window_sdl.cpp          |  9 +++++--
+ tests/smoke/smoke_app.cpp      |  2 ++
+ 5 files changed, 76 insertions(+), 4 deletions(-)
+
+diff --git a/include/rex/ui/surface_apple.h b/include/rex/ui/surface_apple.h
+index 38b6697..4b7bd92 100644
+--- a/include/rex/ui/surface_apple.h
++++ b/include/rex/ui/surface_apple.h
+@@ -16,6 +16,11 @@ struct SDL_Window;
+ namespace rex {
+ namespace ui {
+ 
++// The window's size in pixels. On iOS this is points times the pixel density, not
++// SDL_GetWindowSizeInPixels: once a Metal view exists SDL reports the layer's drawableSize there,
++// which keeps the old orientation after a rotation until a new swapchain is made.
++bool GetSDLWindowPixelSize(SDL_Window* window, int& width_out, int& height_out);
++
+ class MetalLayerSurface final : public Surface {
+  public:
+   MetalLayerSurface(SDL_Window* window, void* metal_layer) : window_(window), layer_(metal_layer) {}
+diff --git a/src/system/xmemory.cpp b/src/system/xmemory.cpp
+index da1b0d3..1409f2b 100644
+--- a/src/system/xmemory.cpp
++++ b/src/system/xmemory.cpp
+@@ -21,6 +21,12 @@
+ 
+ #include <fmt/format.h>
+ 
++#if defined(__APPLE__)
++#include <TargetConditionals.h>
++#if TARGET_OS_IOS
++#include <mach/mach.h>
++#endif
++#endif
+ #include <rex/assert.h>
+ #include <rex/chrono/clock.h>
+ #include <rex/cvar.h>
+@@ -218,6 +224,9 @@ Memory::~Memory() {
+   physical_membase_ = nullptr;
+ }
+ 
++// End of the highest guest view (defined after map_info below).
++[[maybe_unused]] static uint64_t GuestViewSpan();
++
+ bool Memory::Initialize() {
+   file_name_ = fmt::format("xenia_memory_{}", chrono::Clock::QueryHostTickCount());
+ 
+@@ -240,7 +249,31 @@ bool Memory::Initialize() {
+   // Attempt to create our views. This may fail at the first address
+   // we pick, so try a few times.
+   mapping_base_ = 0;
+-  for (size_t n = 32; n < 64; n++) {
++#if REX_PLATFORM_MAC && TARGET_OS_IOS
++  // iOS refuses every fixed base below (the low ones hold the app and the shared cache, the high
++  // ones are beyond the app's address space), but reserving the span anywhere works. Reserve it
++  // with 4 GB of slack, take the 4 GB-aligned base inside (the alignment the fixed bases had),
++  // release the reservation and map the views there.
++  {
++    const uint64_t span = GuestViewSpan();
++    const uint64_t align = 1ull << 32;
++    vm_address_t reservation = 0;
++    const vm_size_t reservation_size = vm_size_t(span + align);
++    if (vm_allocate(mach_task_self(), &reservation, reservation_size, VM_FLAGS_ANYWHERE) ==
++        KERN_SUCCESS) {
++      auto* aligned_base =
++          reinterpret_cast<uint8_t*>((uint64_t(reservation) + align - 1) & ~(align - 1));
++      vm_deallocate(mach_task_self(), reservation, reservation_size);
++      if (!MapViews(aligned_base)) {
++        mapping_base_ = aligned_base;
++      }
++    }
++    if (!mapping_base_) {
++      REXSYS_ERROR("Unable to map the guest views into an address range reserved anywhere.");
++    }
++  }
++#endif
++  for (size_t n = 32; n < 64 && !mapping_base_; n++) {
+     auto mapping_base = reinterpret_cast<uint8_t*>(1ull << n);
+     if (!MapViews(mapping_base)) {
+       mapping_base_ = mapping_base;
+@@ -401,6 +434,14 @@ static const struct {
+         0x0000000100000000ull,
+     },
+ };
++[[maybe_unused]] static uint64_t GuestViewSpan() {
++  uint64_t span = 0;
++  for (const auto& info : map_info) {
++    span = std::max(span, uint64_t(info.virtual_address_end) + 1);
++  }
++  return span;
++}
++
+ int Memory::MapViews(uint8_t* mapping_base) {
+   assert_true(rex::countof(map_info) == rex::countof(views_.all_views));
+   // 0xE0000000 4 KB offset is emulated via host_address_offset and on the CPU
+diff --git a/src/ui/surface_apple.cpp b/src/ui/surface_apple.cpp
+index 7f29b6f..377436b 100644
+--- a/src/ui/surface_apple.cpp
++++ b/src/ui/surface_apple.cpp
+@@ -5,14 +5,33 @@
+ #include <rex/ui/surface_apple.h>
+ 
+ #include <SDL3/SDL.h>
++#include <TargetConditionals.h>
+ 
+ namespace rex {
+ namespace ui {
+ 
++bool GetSDLWindowPixelSize(SDL_Window* window, int& width_out, int& height_out) {
++#if TARGET_OS_IOS
++  int points_width = 0, points_height = 0;
++  if (!SDL_GetWindowSize(window, &points_width, &points_height)) {
++    return false;
++  }
++  const float density = SDL_GetWindowPixelDensity(window);
++  if (density <= 0.0f) {
++    return false;
++  }
++  width_out = int(float(points_width) * density + 0.5f);
++  height_out = int(float(points_height) * density + 0.5f);
++  return true;
++#else
++  return SDL_GetWindowSizeInPixels(window, &width_out, &height_out);
++#endif
++}
++
+ bool MetalLayerSurface::GetSizeImpl(uint32_t& width_out, uint32_t& height_out) const {
+   // Size in pixels (backing store), not points: the swapchain must match the layer's drawable.
+   int width = 0, height = 0;
+-  if (!window_ || !SDL_GetWindowSizeInPixels(window_, &width, &height) || width <= 0 ||
++  if (!window_ || !GetSDLWindowPixelSize(window_, width, height) || width <= 0 ||
+       height <= 0) {
+     return false;
+   }
+diff --git a/src/ui/window_sdl.cpp b/src/ui/window_sdl.cpp
+index 8140e2e..7942470 100644
+--- a/src/ui/window_sdl.cpp
++++ b/src/ui/window_sdl.cpp
+@@ -303,6 +303,11 @@ bool SDLWindow::OpenImpl() {
+   if (IsFullscreen()) {
+     flags |= SDL_WINDOW_FULLSCREEN;
+   }
++#endif
++#if defined(TARGET_OS_IOS) && TARGET_OS_IOS
++  // SDL's view controller picks the allowed orientations itself and may settle on portrait;
++  // games are landscape (as the app's Info.plist also says).
++  SDL_SetHint(SDL_HINT_ORIENTATIONS, "LandscapeLeft LandscapeRight");
+ #endif
+   window_ = SDL_CreateWindow(GetTitle().c_str(), int(GetDesiredLogicalWidth()),
+                              int(GetDesiredLogicalHeight()), flags);
+@@ -463,7 +468,7 @@ void SDLWindow::HandlePaintEvent() {
+ 
+ void SDLWindow::ReportActualSize(WindowDestructionReceiver& destruction_receiver) {
+   int width = 0, height = 0;
+-  if (!SDL_GetWindowSizeInPixels(window_, &width, &height)) {
++  if (!GetSDLWindowPixelSize(window_, width, height)) {
+     return;
+   }
+   OnActualSizeUpdate(uint32_t(std::max(width, 0)), uint32_t(std::max(height, 0)),
+@@ -657,7 +662,7 @@ void SDLWindow::HandleTouch(const SDL_Event& event,
+                             WindowDestructionReceiver& destruction_receiver) {
+   // SDL finger coordinates are normalized (0..1) to the window; the Window API wants pixels.
+   int width = 0, height = 0;
+-  SDL_GetWindowSizeInPixels(window_, &width, &height);
++  GetSDLWindowPixelSize(window_, width, height);
+   TouchEvent::Action action;
+   switch (event.type) {
+     case SDL_EVENT_FINGER_DOWN:
+diff --git a/tests/smoke/smoke_app.cpp b/tests/smoke/smoke_app.cpp
+index f1e7ef3..e0b3c15 100644
+--- a/tests/smoke/smoke_app.cpp
++++ b/tests/smoke/smoke_app.cpp
+@@ -348,6 +348,8 @@ class SmokeApp final : public rex::ui::WindowedApp,
+     ImGui::Begin("ReXGlue smoke test", nullptr,
+                  ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoMove |
+                      ImGuiWindowFlags_NoCollapse);
++    // Build stamp: tells apart builds on a device, where re-signing tools may keep an old upload.
++    ImGui::Text("Build: %s %s", __DATE__, __TIME__);
+     ImGui::Text("Platform: %s %s", PlatformName(), ArchName());
+     ImGui::Text("Window: %u x %u px, %u dpi, %s", window_->GetActualPhysicalWidth(),
+                 window_->GetActualPhysicalHeight(), window_->GetDpi(),
+-- 
+2.54.0 (Apple Git-157)
+
