@@ -1,0 +1,503 @@
+From cf123eb3dde9b141c40c0d765354e36ab438a8d3 Mon Sep 17 00:00:00 2001
+From: WWE13 Recomp <wwe13-recomp@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 11:19:18 -0500
+Subject: [PATCH 123/124] rate census: per-thread CPU and a main-thread sampler
+ on macOS / iOS
+
+- Per-thread CPU from Mach thread info (no /proc), converted from Mach time units, plus the
+  process total and the top 8 threads.
+- WWE13_MAIN_SAMPLE=1: samples the VdSwap thread 500 times a second (suspend, run state, frame
+  pointer walk): running vs waiting per second, and every 5 s the most common stacks as
+  main-executable offsets (symbolize with atos -l 0x100000000).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/core/rate_census.cpp | 386 ++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 381 insertions(+), 5 deletions(-)
+
+diff --git a/src/core/rate_census.cpp b/src/core/rate_census.cpp
+index 07dfff3..8a206e7 100644
+--- a/src/core/rate_census.cpp
++++ b/src/core/rate_census.cpp
+@@ -38,6 +38,15 @@
+ #include <sys/syscall.h>
+ #include <unistd.h>
+ #endif
++#if REX_PLATFORM_MAC
++#include <dlfcn.h>
++#include <mach-o/dyld.h>
++#include <mach-o/loader.h>
++#include <mach/mach.h>
++#include <mach/mach_time.h>
++#include <pthread.h>
++#include <pthread/qos.h>
++#endif
+ 
+ namespace rex::diagnostics::rate_census {
+ namespace {
+@@ -53,7 +62,63 @@ struct LockWait {
+   uint64_t count = 0;
+ };
+ 
++#if REX_PLATFORM_MAC
++// macOS / iOS: no /proc. Walks the task's Mach threads; ids are the low 32 bits of the 64-bit
++// thread id, as rex::thread::current_thread_system_id returns. Times are in microseconds.
++struct MachThreadInfo {
++  uint32_t tid = 0;
++  std::string name;
++  uint64_t user_us = 0;
++  uint64_t system_us = 0;
++};
++
++template <typename Fn>
++void ForEachMachThread(Fn&& fn) {
++  thread_act_array_t threads = nullptr;
++  mach_msg_type_number_t count = 0;
++  if (task_threads(mach_task_self(), &threads, &count) != KERN_SUCCESS) {
++    return;
++  }
++  for (mach_msg_type_number_t i = 0; i < count; ++i) {
++    thread_identifier_info_data_t id_info{};
++    mach_msg_type_number_t id_count = THREAD_IDENTIFIER_INFO_COUNT;
++    thread_extended_info_data_t ext_info{};
++    mach_msg_type_number_t ext_count = THREAD_EXTENDED_INFO_COUNT;
++    if (thread_info(threads[i], THREAD_IDENTIFIER_INFO, reinterpret_cast<thread_info_t>(&id_info),
++                    &id_count) == KERN_SUCCESS &&
++        thread_info(threads[i], THREAD_EXTENDED_INFO, reinterpret_cast<thread_info_t>(&ext_info),
++                    &ext_count) == KERN_SUCCESS) {
++      MachThreadInfo info;
++      info.tid = static_cast<uint32_t>(id_info.thread_id);
++      info.name = ext_info.pth_name[0] ? std::string(ext_info.pth_name) : std::string("?");
++      // pth_user_time / pth_system_time are in Mach absolute-time units (24 MHz ticks on Apple
++      // silicon, nanoseconds on Intel), not nanoseconds.
++      static const mach_timebase_info_data_t timebase = [] {
++        mach_timebase_info_data_t value{};
++        mach_timebase_info(&value);
++        return value;
++      }();
++      info.user_us = ext_info.pth_user_time * timebase.numer / timebase.denom / 1000;
++      info.system_us = ext_info.pth_system_time * timebase.numer / timebase.denom / 1000;
++      fn(info);
++    }
++    mach_port_deallocate(mach_task_self(), threads[i]);
++  }
++  vm_deallocate(mach_task_self(), reinterpret_cast<vm_address_t>(threads),
++                count * sizeof(thread_act_t));
++}
++#endif
++
+ std::string ThreadName(uint32_t tid) {
++#if REX_PLATFORM_MAC
++  std::string name = "?";
++  ForEachMachThread([&](const MachThreadInfo& info) {
++    if (info.tid == tid) {
++      name = info.name;
++    }
++  });
++  return name;
++#endif
+ #if REX_PLATFORM_LINUX
+   std::ifstream comm("/proc/self/task/" + std::to_string(tid) + "/comm");
+   std::string name;
+@@ -169,7 +234,7 @@ struct ThreadTicks {
+ 
+ using ThreadTickMap = std::unordered_map<uint32_t, ThreadTicks>;
+ 
+-bool ParseThreadStat(const std::filesystem::path& path, ThreadTicks& ticks_out) {
++[[maybe_unused]] bool ParseThreadStat(const std::filesystem::path& path, ThreadTicks& ticks_out) {
+ #if !REX_PLATFORM_LINUX
+   (void)path;
+   (void)ticks_out;
+@@ -224,6 +289,15 @@ bool ParseThreadStat(const std::filesystem::path& path, ThreadTicks& ticks_out)
+ 
+ ThreadTickMap ReadThreadTicks() {
+   ThreadTickMap result;
++#if REX_PLATFORM_MAC
++  ForEachMachThread([&](const MachThreadInfo& info) {
++    ThreadTicks ticks;
++    ticks.name = info.name;
++    ticks.utime = info.user_us;
++    ticks.stime = info.system_us;
++    result.emplace(info.tid, std::move(ticks));
++  });
++#endif
+ #if REX_PLATFORM_LINUX
+   std::error_code error;
+   const std::filesystem::path task_root("/proc/self/task");
+@@ -255,6 +329,7 @@ struct ThreadCpu {
+ struct ThreadCpuReport {
+   std::vector<ThreadCpu> top;
+   ThreadCpu vdswap;
++  double total_percent = 0.0;  // All threads of the process (100 = one core busy).
+ };
+ 
+ ThreadCpuReport CalculateThreadCpu(const ThreadTickMap& previous,
+@@ -267,6 +342,8 @@ ThreadCpuReport CalculateThreadCpu(const ThreadTickMap& previous,
+ 
+ #if REX_PLATFORM_LINUX
+   const long clock_ticks = std::max<long>(1, sysconf(_SC_CLK_TCK));
++#elif REX_PLATFORM_MAC
++  constexpr long clock_ticks = 1000000;  // ReadThreadTicks reports microseconds.
+ #else
+   constexpr long clock_ticks = 100;
+ #endif
+@@ -312,8 +389,11 @@ ThreadCpuReport CalculateThreadCpu(const ThreadTickMap& previous,
+     }
+     return left.tid < right.tid;
+   });
+-  if (report.top.size() > 5) {
+-    report.top.resize(5);
++  for (const ThreadCpu& thread : report.top) {
++    report.total_percent += thread.percent;
++  }
++  if (report.top.size() > 8) {
++    report.top.resize(8);
+   }
+   return report;
+ }
+@@ -332,6 +412,287 @@ std::string FormatThreadCpu(const std::vector<ThreadCpu>& threads) {
+   return result;
+ }
+ 
++#if REX_PLATFORM_MAC
++// WWE13_MAIN_SAMPLE=1 (with WWE13_RATE_CENSUS=1): wall-clock sampling of the thread that calls
++// VdSwap (the game's main thread). WWE13_MAIN_SAMPLE_HZ sets the rate (default 500). Each sample
++// suspends the thread for a few microseconds, reads its run state and walks its frame pointers.
++// Once a second: how often it was running vs waiting; every 5 s the most common stacks, as
++// offsets into the main executable (symbolize with atos -o wwe13 -l 0x100000000 0x1<offset>).
++class MainThreadSampler {
++ public:
++  void Start() {
++    const char* value = std::getenv("WWE13_MAIN_SAMPLE");
++    if (!value || std::string_view(value) != "1") {
++      return;
++    }
++    if (const char* hz = std::getenv("WWE13_MAIN_SAMPLE_HZ")) {
++      hz_ = std::clamp(std::atoi(hz), 10, 2000);
++    }
++    const mach_header* header = _dyld_get_image_header(0);
++    image_base_ = reinterpret_cast<uintptr_t>(header);
++    image_end_ = image_base_;
++    const auto* command = reinterpret_cast<const load_command*>(
++        reinterpret_cast<const mach_header_64*>(header) + 1);
++    for (uint32_t i = 0; i < header->ncmds; ++i) {
++      if (command->cmd == LC_SEGMENT_64) {
++        const auto* segment = reinterpret_cast<const segment_command_64*>(command);
++        if (std::string_view(segment->segname) == "__TEXT") {
++          image_end_ = image_base_ + segment->vmsize;
++        }
++      }
++      command = reinterpret_cast<const load_command*>(
++          reinterpret_cast<const uint8_t*>(command) + command->cmdsize);
++    }
++    running_.store(true);
++    thread_ = std::thread(&MainThreadSampler::Run, this);
++    REXLOG_INFO("[rate-census-main] sampler enabled hz={} text=0x{:x} bytes", hz_,
++                image_end_ - image_base_);
++  }
++
++  void Stop() {
++    if (running_.exchange(false) && thread_.joinable()) {
++      thread_.join();
++    }
++  }
++
++  bool enabled() const { return running_.load(); }
++  void SetTarget(uint32_t tid) { target_tid_.store(tid, std::memory_order_relaxed); }
++
++  void Report(uint64_t t_ms) {
++    Window window;
++    {
++      std::lock_guard<std::mutex> lock(mutex_);
++      window = std::move(second_);
++      second_ = {};
++      for (const auto& [key, count] : window.stacks) {
++        stacks_5s_[key] += count;
++      }
++      samples_5s_ += window.samples;
++    }
++    REXLOG_INFO("[rate-census-main] t_ms={} tid={} samples={} running={} waiting={} other={} "
++                "failed={} qos={}",
++                t_ms, target_tid_.load(), window.samples, window.running, window.waiting,
++                window.other, window.failed, QosName(window.qos));
++    if (++seconds_ % 5 != 0) {
++      return;
++    }
++    std::vector<std::pair<std::string, uint32_t>> top(stacks_5s_.begin(), stacks_5s_.end());
++    std::sort(top.begin(), top.end(),
++              [](const auto& a, const auto& b) { return a.second > b.second; });
++    if (top.size() > 12) {
++      top.resize(12);
++    }
++    REXLOG_INFO("[rate-census-stacks] t_ms={} samples={} distinct={}", t_ms, samples_5s_,
++                stacks_5s_.size());
++    for (const auto& [key, count] : top) {
++      REXLOG_INFO("[rate-census-stack] n={} pct={:.1f} {}", count,
++                  samples_5s_ ? 100.0 * count / samples_5s_ : 0.0, Describe(key));
++    }
++    stacks_5s_.clear();
++    samples_5s_ = 0;
++  }
++
++ private:
++  struct Window {
++    uint32_t samples = 0, running = 0, waiting = 0, other = 0, failed = 0;
++    int qos = 0;
++    std::unordered_map<std::string, uint32_t> stacks;
++  };
++
++  static const char* QosName(int qos) {
++    switch (qos) {
++      case QOS_CLASS_USER_INTERACTIVE: return "user-interactive";
++      case QOS_CLASS_USER_INITIATED: return "user-initiated";
++      case QOS_CLASS_DEFAULT: return "default";
++      case QOS_CLASS_UTILITY: return "utility";
++      case QOS_CLASS_BACKGROUND: return "background";
++      case QOS_CLASS_UNSPECIFIED: return "unspecified";
++      default: return "?";
++    }
++  }
++
++  static uintptr_t Strip(uintptr_t address) { return address & 0x0000000FFFFFFFFFull; }
++
++  // Key: state letter, the first frame outside the main executable (a system call or library
++  // routine, resolved later with dladdr), then up to 10 main-executable frames as offsets.
++  std::string Describe(const std::string& key) const {
++    std::string out;
++    std::istringstream stream(key);
++    std::string token;
++    bool first = true;
++    while (std::getline(stream, token, ' ')) {
++      if (first) {
++        out += token == "R" ? "running" : token == "W" ? "waiting" : "other";
++        first = false;
++        continue;
++      }
++      if (token.rfind("L", 0) == 0) {
++        const uintptr_t address = std::strtoull(token.c_str() + 1, nullptr, 16);
++        Dl_info info{};
++        if (address && dladdr(reinterpret_cast<void*>(address), &info) && info.dli_sname) {
++          out += fmt::format(" [{}]", info.dli_sname);
++        } else {
++          out += " [?]";
++        }
++        continue;
++      }
++      out += " " + token;
++    }
++    return out;
++  }
++
++  thread_act_t FindThread(uint32_t tid) {
++    thread_act_array_t threads = nullptr;
++    mach_msg_type_number_t count = 0;
++    thread_act_t found = MACH_PORT_NULL;
++    if (task_threads(mach_task_self(), &threads, &count) != KERN_SUCCESS) {
++      return found;
++    }
++    for (mach_msg_type_number_t i = 0; i < count; ++i) {
++      thread_identifier_info_data_t info{};
++      mach_msg_type_number_t info_count = THREAD_IDENTIFIER_INFO_COUNT;
++      if (found == MACH_PORT_NULL &&
++          thread_info(threads[i], THREAD_IDENTIFIER_INFO, reinterpret_cast<thread_info_t>(&info),
++                      &info_count) == KERN_SUCCESS &&
++          static_cast<uint32_t>(info.thread_id) == tid) {
++        found = threads[i];  // Keep this send right.
++        continue;
++      }
++      mach_port_deallocate(mach_task_self(), threads[i]);
++    }
++    vm_deallocate(mach_task_self(), reinterpret_cast<vm_address_t>(threads),
++                  count * sizeof(thread_act_t));
++    return found;
++  }
++
++  void Run() {
++    const auto period = std::chrono::microseconds(1000000 / hz_);
++    uint32_t current_tid = 0;
++    thread_act_t port = MACH_PORT_NULL;
++    uintptr_t stack_low = 0, stack_high = 0;
++    int qos = 0;
++    uintptr_t frames[32];
++    auto next = std::chrono::steady_clock::now();
++    while (running_.load()) {
++      next += period;
++      std::this_thread::sleep_until(next);
++      const uint32_t tid = target_tid_.load(std::memory_order_relaxed);
++      if (tid != current_tid) {
++        if (port != MACH_PORT_NULL) {
++          mach_port_deallocate(mach_task_self(), port);
++        }
++        port = tid ? FindThread(tid) : MACH_PORT_NULL;
++        current_tid = tid;
++        stack_low = stack_high = 0;
++        if (port != MACH_PORT_NULL) {
++          if (pthread_t pthread = pthread_from_mach_thread_np(port)) {
++            stack_high = reinterpret_cast<uintptr_t>(pthread_get_stackaddr_np(pthread));
++            stack_low = stack_high - pthread_get_stacksize_np(pthread);
++            qos_class_t qos_class = QOS_CLASS_UNSPECIFIED;
++            int relative = 0;
++            pthread_get_qos_class_np(pthread, &qos_class, &relative);
++            qos = qos_class;
++          }
++        }
++      }
++      if (port == MACH_PORT_NULL) {
++        continue;
++      }
++      thread_basic_info_data_t basic{};
++      mach_msg_type_number_t basic_count = THREAD_BASIC_INFO_COUNT;
++      if (thread_info(port, THREAD_BASIC_INFO, reinterpret_cast<thread_info_t>(&basic),
++                      &basic_count) != KERN_SUCCESS) {
++        // The thread exited; look it up again next time.
++        mach_port_deallocate(mach_task_self(), port);
++        port = MACH_PORT_NULL;
++        current_tid = 0;
++        continue;
++      }
++      size_t frame_count = 0;
++      bool ok = false;
++      if (thread_suspend(port) == KERN_SUCCESS) {
++        arm_thread_state64_t state{};
++        mach_msg_type_number_t state_count = ARM_THREAD_STATE64_COUNT;
++        if (thread_get_state(port, ARM_THREAD_STATE64, reinterpret_cast<thread_state_t>(&state),
++                             &state_count) == KERN_SUCCESS) {
++          ok = true;
++          frames[frame_count++] = Strip(arm_thread_state64_get_pc(state));
++          frames[frame_count++] = Strip(arm_thread_state64_get_lr(state));
++          uintptr_t fp = Strip(arm_thread_state64_get_fp(state));
++          while (frame_count < 32 && fp >= stack_low && fp + 16 <= stack_high && !(fp & 0xF)) {
++            const uintptr_t* record = reinterpret_cast<const uintptr_t*>(fp);
++            const uintptr_t next_fp = Strip(record[0]);
++            frames[frame_count++] = Strip(record[1]);
++            if (next_fp <= fp) {
++              break;
++            }
++            fp = next_fp;
++          }
++        }
++        thread_resume(port);
++      }
++      // Build the key after resuming (no locks are taken while the thread is suspended).
++      std::string key;
++      const char state_letter =
++          basic.run_state == TH_STATE_RUNNING ? 'R'
++          : (basic.run_state == TH_STATE_WAITING || basic.run_state == TH_STATE_UNINTERRUPTIBLE)
++              ? 'W'
++              : 'O';
++      key += state_letter;
++      if (ok) {
++        bool library_frame_added = false;
++        int main_frames = 0;
++        uintptr_t previous = 0;
++        for (size_t i = 0; i < frame_count && main_frames < 10; ++i) {
++          const uintptr_t address = frames[i];
++          if (address == previous) {
++            continue;  // pc and lr can name the same frame.
++          }
++          previous = address;
++          if (address >= image_base_ && address < image_end_) {
++            key += fmt::format(" +{:x}", address - image_base_);
++            ++main_frames;
++          } else if (!library_frame_added && main_frames == 0) {
++            key += fmt::format(" L{:x}", address);
++            library_frame_added = true;
++          }
++        }
++      }
++      std::lock_guard<std::mutex> lock(mutex_);
++      ++second_.samples;
++      second_.qos = qos;
++      if (!ok) {
++        ++second_.failed;
++        continue;
++      }
++      if (state_letter == 'R') {
++        ++second_.running;
++      } else if (state_letter == 'W') {
++        ++second_.waiting;
++      } else {
++        ++second_.other;
++      }
++      ++second_.stacks[key];
++    }
++    if (port != MACH_PORT_NULL) {
++      mach_port_deallocate(mach_task_self(), port);
++    }
++  }
++
++  int hz_ = 500;
++  uintptr_t image_base_ = 0;
++  uintptr_t image_end_ = 0;
++  std::atomic<bool> running_{false};
++  std::atomic<uint32_t> target_tid_{0};
++  std::thread thread_;
++  std::mutex mutex_;
++  Window second_;
++  std::unordered_map<std::string, uint32_t> stacks_5s_;
++  uint32_t samples_5s_ = 0;
++  uint32_t seconds_ = 0;
++};
++#endif
++
+ class RateCensus {
+  public:
+   ~RateCensus() { Stop(); }
+@@ -366,6 +727,9 @@ class RateCensus {
+     enabled_.store(true, std::memory_order_release);
+     running_.store(true, std::memory_order_release);
+     logger_thread_ = std::thread(&RateCensus::Run, this);
++#if REX_PLATFORM_MAC
++    main_sampler_.Start();
++#endif
+   }
+ 
+   void Stop() {
+@@ -382,6 +746,9 @@ class RateCensus {
+     if (logger_thread.joinable()) {
+       logger_thread.join();
+     }
++#if REX_PLATFORM_MAC
++    main_sampler_.Stop();
++#endif
+     enabled_.store(false, std::memory_order_release);
+   }
+ 
+@@ -864,9 +1231,9 @@ class RateCensus {
+                   sample.t_ms, sample.submission_worker_busy_ms,
+                   sample.submission_worker_jobs_per_s);
+       REXLOG_INFO(
+-          "[rate-census-cpu] t_ms={} vdswap_tid={} vdswap_thread={} "
++          "[rate-census-cpu] t_ms={} total_pct={:.1f} vdswap_tid={} vdswap_thread={} "
+           "vdswap_thread_cpu_pct={:.3f} top={}",
+-          sample.t_ms, sample.vdswap_tid,
++          sample.t_ms, thread_cpu.total_percent, sample.vdswap_tid,
+           thread_cpu.vdswap.name.empty() ? "unknown" : thread_cpu.vdswap.name,
+           sample.vdswap_thread_cpu_pct, FormatThreadCpu(thread_cpu.top));
+       REXLOG_INFO(
+@@ -890,6 +1257,12 @@ class RateCensus {
+           "pixel_reused={}",
+           sample.t_ms, descriptor_set_writes[0], descriptor_set_reuses[0],
+           descriptor_set_writes[1], descriptor_set_reuses[1]);
++#if REX_PLATFORM_MAC
++      if (main_sampler_.enabled()) {
++        main_sampler_.SetTarget(current.vdswap_tid);
++        main_sampler_.Report(sample.t_ms);
++      }
++#endif
+ 
+       last_host_ms = host_ms;
+       last_guest_ticks = guest_ticks;
+@@ -906,6 +1279,9 @@ class RateCensus {
+   mutable std::mutex sample_mutex_;
+   bool started_ = false;
+   std::thread logger_thread_;
++#if REX_PLATFORM_MAC
++  MainThreadSampler main_sampler_;
++#endif
+   std::optional<Sample> latest_sample_;
+   uint64_t vblank_interval_ticks_ = 0;
+   double refresh_rate_hz_ = 0.0;
+-- 
+2.54.0 (Apple Git-157)
+

@@ -1,0 +1,283 @@
+From 6254a3efb45244674ba0e43b8394c95ea73f2971 Mon Sep 17 00:00:00 2001
+From: WWE13 Recomp <wwe13-recomp@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 11:19:18 -0500
+Subject: [PATCH 124/124] vulkan: MoltenVK queue statistics in the GPU timing
+ census
+
+With MVK_CONFIG_PERFORMANCE_TRACKING=1, logs MoltenVK's statistics once a second as [mvk-stats]
+(MTLCommandBuffer commit-to-completion time, encoding, drawable waits, shader compiles). The
+setting is also passed through VK_EXT_layer_settings at instance creation, since MoltenVK may
+only read environment variables present at launch. vkGetPerformanceStatisticsMVK is taken from
+vkGetDeviceProcAddr or the loaded MoltenVK image (through the Vulkan loader the instance-level
+lookup returns a trampoline that misreads the VkDevice).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ include/rex/ui/vulkan/instance.h   |   1 +
+ src/graphics/vulkan/gpu_timing.cpp | 136 +++++++++++++++++++++++++++++
+ src/graphics/vulkan/gpu_timing.h   |  11 +++
+ src/ui/vulkan/vulkan_instance.cpp  |  30 +++++++
+ 4 files changed, 178 insertions(+)
+
+diff --git a/include/rex/ui/vulkan/instance.h b/include/rex/ui/vulkan/instance.h
+index 5da9073..c03360b 100644
+--- a/include/rex/ui/vulkan/instance.h
++++ b/include/rex/ui/vulkan/instance.h
+@@ -102,6 +102,7 @@ class VulkanInstance {
+     bool ext_1_1_KHR_get_physical_device_properties2 = false;  // #60
+     bool ext_EXT_debug_utils = false;                          // #129
+     bool ext_KHR_portability_enumeration = false;              // #395
++    bool ext_EXT_layer_settings = false;                       // #497
+   };
+ 
+   const Extensions& extensions() const { return extensions_; }
+diff --git a/src/graphics/vulkan/gpu_timing.cpp b/src/graphics/vulkan/gpu_timing.cpp
+index 00db360..9e16f4c 100644
+--- a/src/graphics/vulkan/gpu_timing.cpp
++++ b/src/graphics/vulkan/gpu_timing.cpp
+@@ -14,6 +14,12 @@
+ 
+ #include <rex/assert.h>
+ #include <rex/logging.h>
++#include <rex/platform.h>
++#if REX_PLATFORM_MAC
++#include <dlfcn.h>
++#include <mach-o/dyld.h>
++#endif
++#include <cstring>
+ #include <rex/ui/vulkan/device.h>
+ 
+ namespace rex::graphics::vulkan {
+@@ -86,8 +92,132 @@ void GpuTiming::DisableForUnsupported(const char* reason) {
+   enabled_ = false;
+ }
+ 
++namespace {
++
++// Mirrors MoltenVK's mvk_private_api.h (MVK_PRIVATE_API_VERSION 43, MoltenVK 1.4.x); MoltenVK
++// copies min(its size, ours), so only the leading members need to match.
++struct MvkTracker {
++  uint32_t count;
++  double latest;
++  double previous;
++  double average;
++  double minimum;
++  double maximum;
++};
++struct MvkStatistics {
++  MvkTracker shader_compilation[11];
++  MvkTracker pipeline_cache[3];
++  MvkTracker retrieve_mtl_command_buffer;
++  MvkTracker command_buffer_encoding;
++  MvkTracker wait_submit_command_buffers;
++  MvkTracker submit_command_buffers;
++  MvkTracker mtl_command_buffer_execution;
++  MvkTracker retrieve_ca_metal_drawable;
++  MvkTracker wait_present_swapchains;
++  MvkTracker present_swapchains;
++  MvkTracker frame_interval;
++  MvkTracker gpu_memory_allocated;
++};
++using PfnGetPerformanceStatisticsMvk = VkResult(VKAPI_PTR*)(VkDevice, MvkStatistics*, size_t*);
++
++double TrackerTotal(const MvkTracker& tracker) { return double(tracker.count) * tracker.average; }
++
++}  // namespace
++
++void GpuTiming::StartMoltenVkStats(const ui::vulkan::VulkanDevice* vulkan_device) {
++#if REX_PLATFORM_MAC
++  const char* tracking = std::getenv("MVK_CONFIG_PERFORMANCE_TRACKING");
++  if (!tracking || std::string_view(tracking) != "1" || mvk_running_.load()) {
++    return;
++  }
++  const ui::vulkan::VulkanInstance::Functions& ifn = vulkan_device->vulkan_instance()->functions();
++  mvk_device_ = vulkan_device->device();
++  // A device-level function: through the Vulkan loader (macOS), vkGetInstanceProcAddr would
++  // return a physical-device trampoline that misreads the VkDevice argument.
++  mvk_get_performance_statistics_ =
++      reinterpret_cast<void*>(ifn.vkGetDeviceProcAddr(mvk_device_, "vkGetPerformanceStatisticsMVK"));
++  if (!mvk_get_performance_statistics_) {
++    // Not served through vkGet*ProcAddr: take the export from the loaded MoltenVK image. The
++    // VkDevice the app holds is MoltenVK's own (the loader passes dispatchable handles through).
++    for (uint32_t i = 0, count = _dyld_image_count(); i < count; ++i) {
++      const char* name = _dyld_get_image_name(i);
++      if (name && std::strstr(name, "MoltenVK")) {
++        if (void* handle = dlopen(name, RTLD_LAZY | RTLD_NOLOAD)) {
++          mvk_get_performance_statistics_ = dlsym(handle, "vkGetPerformanceStatisticsMVK");
++          dlclose(handle);
++        }
++        if (mvk_get_performance_statistics_) {
++          break;
++        }
++      }
++    }
++  }
++  if (!mvk_get_performance_statistics_) {
++    REXLOG_INFO("[mvk-stats] vkGetPerformanceStatisticsMVK is not available");
++    return;
++  }
++  mvk_running_.store(true);
++  mvk_thread_ = std::thread(&GpuTiming::MoltenVkStatsMain, this);
++  REXLOG_INFO("[mvk-stats] enabled");
++#else
++  (void)vulkan_device;
++#endif
++}
++
++void GpuTiming::MoltenVkStatsMain() {
++  auto get = reinterpret_cast<PfnGetPerformanceStatisticsMvk>(mvk_get_performance_statistics_);
++  MvkStatistics last{};
++  bool have_last = false;
++  auto previous_time = std::chrono::steady_clock::now();
++  for (;;) {
++    {
++      std::unique_lock<std::mutex> lock(mvk_mutex_);
++      mvk_condition_.wait_for(lock, std::chrono::seconds(1), [this] { return !mvk_running_.load(); });
++      if (!mvk_running_.load()) {
++        return;
++      }
++    }
++    MvkStatistics now{};
++    size_t size = sizeof(now);
++    if (get(mvk_device_, &now, &size) != VK_SUCCESS && size == 0) {
++      continue;
++    }
++    const auto time = std::chrono::steady_clock::now();
++    const double seconds = std::chrono::duration<double>(time - previous_time).count();
++    previous_time = time;
++    if (have_last && seconds > 0.0) {
++      auto per_s = [&](const MvkTracker& a, const MvkTracker& b) {
++        return (TrackerTotal(a) - TrackerTotal(b)) / seconds;
++      };
++      auto count_per_s = [&](const MvkTracker& a, const MvkTracker& b) {
++        return double(a.count - b.count) / seconds;
++      };
++      const double exec_count = count_per_s(now.mtl_command_buffer_execution,
++                                            last.mtl_command_buffer_execution);
++      REXLOG_INFO(
++          "[mvk-stats] mtl_cb_per_s={:.1f} mtl_cb_exec_ms_per_s={:.1f} mtl_cb_exec_max_ms={:.2f} "
++          "encode_ms_per_s={:.1f} submit_ms_per_s={:.1f} drawable_wait_ms_per_s={:.1f} "
++          "present_ms_per_s={:.1f} frame_interval_ms={:.2f} msl_compile_ms_per_s={:.1f} "
++          "pipeline_compile_ms_per_s={:.1f}",
++          exec_count,
++          per_s(now.mtl_command_buffer_execution, last.mtl_command_buffer_execution),
++          now.mtl_command_buffer_execution.latest,
++          per_s(now.command_buffer_encoding, last.command_buffer_encoding),
++          per_s(now.submit_command_buffers, last.submit_command_buffers),
++          per_s(now.retrieve_ca_metal_drawable, last.retrieve_ca_metal_drawable),
++          per_s(now.present_swapchains, last.present_swapchains),
++          now.frame_interval.average,
++          per_s(now.shader_compilation[2], last.shader_compilation[2]),
++          per_s(now.shader_compilation[9], last.shader_compilation[9]));
++    }
++    last = now;
++    have_last = true;
++  }
++}
++
+ bool GpuTiming::Initialize(const ui::vulkan::VulkanDevice* vulkan_device,
+                            uint32_t graphics_queue_family) {
++  StartMoltenVkStats(vulkan_device);
+   if (!Requested()) {
+     return false;
+   }
+@@ -161,6 +291,12 @@ bool GpuTiming::Initialize(const ui::vulkan::VulkanDevice* vulkan_device,
+ }
+ 
+ void GpuTiming::Shutdown() {
++  if (mvk_running_.exchange(false)) {
++    mvk_condition_.notify_all();
++  }
++  if (mvk_thread_.joinable()) {
++    mvk_thread_.join();
++  }
+   if (reporter_running_.exchange(false, std::memory_order_acq_rel)) {
+     reporter_condition_.notify_all();
+   }
+diff --git a/src/graphics/vulkan/gpu_timing.h b/src/graphics/vulkan/gpu_timing.h
+index aebf543..e1e464d 100644
+--- a/src/graphics/vulkan/gpu_timing.h
++++ b/src/graphics/vulkan/gpu_timing.h
+@@ -137,6 +137,10 @@ class GpuTiming {
+   void CompleteRecord(SubmissionRecord&& record);
+   void FinalizeReadyFramesLocked();
+   void ReporterMain();
++  // macOS / iOS: once a second, MoltenVK's own queue statistics (MTLCommandBuffer commit-to-
++  // completion time, encoding, drawable waits), when MVK_CONFIG_PERFORMANCE_TRACKING=1.
++  void StartMoltenVkStats(const ui::vulkan::VulkanDevice* vulkan_device);
++  void MoltenVkStatsMain();
+ 
+   const ui::vulkan::VulkanDevice* vulkan_device_ = nullptr;
+   VkDevice device_ = VK_NULL_HANDLE;
+@@ -158,6 +162,13 @@ class GpuTiming {
+   WindowRecord report_window_{};
+   std::atomic<bool> reporter_running_{false};
+   std::thread reporter_thread_;
++
++  void* mvk_get_performance_statistics_ = nullptr;  // PFN_vkGetPerformanceStatisticsMVK
++  VkDevice mvk_device_ = VK_NULL_HANDLE;
++  std::atomic<bool> mvk_running_{false};
++  std::mutex mvk_mutex_;
++  std::condition_variable mvk_condition_;
++  std::thread mvk_thread_;
+ };
+ 
+ }  // namespace rex::graphics::vulkan
+diff --git a/src/ui/vulkan/vulkan_instance.cpp b/src/ui/vulkan/vulkan_instance.cpp
+index 32879e0..62b8505 100644
+--- a/src/ui/vulkan/vulkan_instance.cpp
++++ b/src/ui/vulkan/vulkan_instance.cpp
+@@ -9,6 +9,9 @@
+  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+  */
+ 
++#include <string_view>
++#include <iterator>
++#include <cstdlib>
+ #include <chrono>
+ #include <sstream>
+ #include <string>
+@@ -110,6 +113,12 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(const bool with_surface,
+   // #395.
+   requested_extensions.emplace("VK_KHR_portability_enumeration",
+                                &vulkan_instance->extensions_.ext_KHR_portability_enumeration);
++#if REX_PLATFORM_MAC
++  // #497: passes MoltenVK settings at instance creation (MoltenVK may only see environment
++  // variables that existed at launch, not ones the game sets from wwe13-env.txt on iOS).
++  requested_extensions.emplace("VK_EXT_layer_settings",
++                               &vulkan_instance->extensions_.ext_EXT_layer_settings);
++#endif
+   if (with_surface) {
+     // #1.
+     requested_extensions.emplace("VK_KHR_surface", &vulkan_instance->extensions_.ext_KHR_surface);
+@@ -328,6 +337,27 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(const bool with_surface,
+   instance_create_info.ppEnabledLayerNames = enabled_layers.data();
+   instance_create_info.enabledExtensionCount = uint32_t(enabled_extensions.size());
+   instance_create_info.ppEnabledExtensionNames = enabled_extensions.data();
++#if REX_PLATFORM_MAC
++  // MVK_CONFIG_PERFORMANCE_TRACKING=1 turns on MoltenVK's statistics (read by the GPU timing
++  // census as [mvk-stats]). The setting is passed under both spellings MoltenVK may use.
++  const VkBool32 mvk_performance_tracking = VK_TRUE;
++  const VkLayerSettingEXT mvk_settings[] = {
++      {"MoltenVK", "MVK_CONFIG_PERFORMANCE_TRACKING", VK_LAYER_SETTING_TYPE_BOOL32_EXT, 1,
++       &mvk_performance_tracking},
++      {"MoltenVK", "PERFORMANCE_TRACKING", VK_LAYER_SETTING_TYPE_BOOL32_EXT, 1,
++       &mvk_performance_tracking},
++  };
++  VkLayerSettingsCreateInfoEXT mvk_layer_settings = {};
++  mvk_layer_settings.sType = VK_STRUCTURE_TYPE_LAYER_SETTINGS_CREATE_INFO_EXT;
++  mvk_layer_settings.settingCount = uint32_t(std::size(mvk_settings));
++  mvk_layer_settings.pSettings = mvk_settings;
++  if (vulkan_instance->extensions_.ext_EXT_layer_settings) {
++    const char* tracking = std::getenv("MVK_CONFIG_PERFORMANCE_TRACKING");
++    if (tracking && std::string_view(tracking) == "1") {
++      instance_create_info.pNext = &mvk_layer_settings;
++    }
++  }
++#endif
+   VkResult instance_create_result =
+       ifn.vkCreateInstance(&instance_create_info, nullptr, &vulkan_instance->instance_);
+ 
+-- 
+2.54.0 (Apple Git-157)
+

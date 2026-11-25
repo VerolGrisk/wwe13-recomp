@@ -13,8 +13,10 @@
 #include <filesystem>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <string_view>
 #include <utility>
+#include <vector>
 
 #if !defined(_WIN32) && !defined(__APPLE__)
 #include <gtk/gtk.h>
@@ -73,6 +75,12 @@ class Wwe13App : public rex::ReXApp {
     // itself is read-only).
     if (const char* documents = SDL_GetUserFolder(SDL_FOLDER_DOCUMENTS)) {
       const std::filesystem::path documents_path(documents);
+      // iPad defaults: 2x MSAA and a 1024x576 scene keep entrances at the game's 30 fps on an
+      // A20 Pro (at the game's own 720p / 4x the GPU falls ~100 ms behind there). Lines in
+      // wwe13-env.txt override them (WWE13_INTERNAL_RES=720, WWE13_SCENE_AA=4x for the game's).
+      setenv("WWE13_SCENE_AA", "2x", 0);
+      setenv("WWE13_INTERNAL_RES", "576", 0);
+      ApplyEnvironmentFile(documents_path / "wwe13-env.txt");
       if (!GetArgument("game_directory")) {
         paths.game_data_root = documents_path / "WWE 13";
       }
@@ -88,6 +96,9 @@ class Wwe13App : public rex::ReXApp {
 
   void OnPreSetup(rex::RuntimeConfig& config) override {
     (void)config;
+    for (const std::string& entry : env_file_entries_) {
+      REXLOG_INFO("[wwe13] wwe13-env.txt: {}", entry);
+    }
     // GitHub #6: a second start-up against the same user-data folder becomes a second game
     // process fighting over the GPU (players hit this by clicking Play again while the first,
     // slow shader-preparation start-up still looks frozen). Acquire the per-user-data lock
@@ -310,6 +321,40 @@ class Wwe13App : public rex::ReXApp {
   std::shared_ptr<Wwe13FrameHistory> frame_history_;
   std::unique_ptr<Wwe13PerfOverlay> perf_overlay_;
   std::filesystem::path game_data_root_;
+#if defined(TARGET_OS_IOS) && TARGET_OS_IOS
+  // iOS has no environment for a player to set, so the env-gated diagnostics (WWE13_RATE_CENSUS
+  // and the others) read KEY=VALUE lines from Documents/wwe13-env.txt (Files app: On My iPad >
+  // WWE 13). Lines starting with # are comments. Applied before the runtime and graphics start.
+  void ApplyEnvironmentFile(const std::filesystem::path& path) {
+    std::FILE* file = std::fopen(path.c_str(), "r");
+    if (!file) {
+      return;
+    }
+    char line[512];
+    while (std::fgets(line, sizeof(line), file)) {
+      std::string entry(line);
+      while (!entry.empty() && (entry.back() == '\n' || entry.back() == '\r' ||
+                                entry.back() == ' ' || entry.back() == '\t')) {
+        entry.pop_back();
+      }
+      const size_t start = entry.find_first_not_of(" \t");
+      if (start == std::string::npos || entry[start] == '#') {
+        continue;
+      }
+      entry.erase(0, start);
+      const size_t equals = entry.find('=');
+      if (equals == std::string::npos || equals == 0) {
+        continue;
+      }
+      const std::string key = entry.substr(0, equals);
+      const std::string value = entry.substr(equals + 1);
+      setenv(key.c_str(), value.c_str(), 1);
+      env_file_entries_.push_back(key + "=" + value);  // Logged once logging is set up.
+    }
+    std::fclose(file);
+  }
+#endif
+  std::vector<std::string> env_file_entries_;
   std::filesystem::path user_data_root_;
   wwe13::GameFileCheckResult game_file_check_result_ =
       wwe13::GameFileCheckResult::kSupported;

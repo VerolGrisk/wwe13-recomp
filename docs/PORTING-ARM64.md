@@ -363,11 +363,46 @@ Mac build.
   affinities are ignored; the warning about it is logged once instead of on every CPU move
   (it was ~250 lines a second).
 
-First performance numbers (from the `[wwe13-flip]` lines): menus run at 52–53 fps. In an entrance
-the game switches itself to 30 fps but the iPad reaches only **13–24 fps for the whole entrance**,
-with almost every flip late. Pipeline creation is not the cause (364 pipelines, nearly all in one
-burst before the entrance, none afterwards while it stays slow), so it is sustained CPU or GPU
-throughput; which one is the next thing to measure.
+### iPad performance (patches 0121–0124)
+
+Measured on the iPad mini (A20 Pro: 5 cores, 2 performance) in the same entrance each time.
+The game switches itself to 30 fps for entrances; menus run at 52–53 fps throughout.
+
+| Step | Entrance | Finding |
+| --- | --- | --- |
+| First build | 13–24 fps | two audio threads used most of a core each, pipelines rebuilt every run |
+| 0121 blocking multi-object waits | 17–25 fps | audio threads idle; CPU no longer the limit (1.5 of 5 cores) |
+| 0122 storage read back | 17–25 fps | 198 pipelines load at start-up, none built in the entrance |
+| 0121 QoS, 0123–0124 sampler and MoltenVK statistics | 19–25 fps | the GPU falls ~100 ms behind; the main thread spins in the game's own wait-for-GPU loop (`sub_82B99A70`) |
+| `WWE13_SCENE_AA=2x` | 28.9 fps | GPU lag 5–25 ms, spikes to 77 ms in heavy shots |
+| `WWE13_SCENE_AA=2x` + `WWE13_INTERNAL_RES=576` | **29.1 fps** | 1 second of 78 below 27 fps |
+
+- **0121:** `PosixConditionBase::WaitMultiple` polled with try-locks and sleeps that rounded down to
+  zero inside each 1 ms alertable slice. Waiters now register with every handle and are woken by
+  its state change. On the Mac the game in menus went from 221 % to 53 % CPU. Game threads are
+  also created with the user-interactive QoS class on Apple (`WWE13_THREAD_QOS=off` to compare);
+  it made no measurable difference to the entrance, which is GPU-bound.
+- **0122:** the pipeline and shader storage files are opened `"a+b"`; BSD libc reads such a file
+  from the end, so on macOS / iOS nothing was ever read back and every start truncated the files.
+- **0123–0124 (diagnostics):** per-thread CPU from Mach thread info, a main-thread sampler
+  (`WWE13_MAIN_SAMPLE=1`, stacks as offsets for `atos`), and MoltenVK's queue statistics
+  (`MVK_CONFIG_PERFORMANCE_TRACKING=1`, passed through `VK_EXT_layer_settings`).
+- **iOS defaults:** `WWE13_SCENE_AA=2x` and `WWE13_INTERNAL_RES=576` unless `wwe13-env.txt` sets
+  them (`WWE13_INTERNAL_RES=720`, `WWE13_SCENE_AA=4x` restore the game's own choice). The Mac and
+  PC builds keep the game's settings.
+
+`wwe13-env.txt` (Files app: On My iPad > WWE 13, next to the game folder) sets the env-gated
+options on iOS, one `NAME=VALUE` per line. For a performance log:
+
+```text
+WWE13_RATE_CENSUS=1
+WWE13_MAIN_SAMPLE=1
+MVK_CONFIG_PERFORMANCE_TRACKING=1
+```
+
+Open: which GPU work is expensive in heavy shots (the per-category `WWE13_GPU_TIMING` census
+records no frames under MoltenVK yet), so that 720p can come back; brief pop-in the player saw
+during the GPU spikes at 720p / 2x.
 
 ## Planned next steps
 

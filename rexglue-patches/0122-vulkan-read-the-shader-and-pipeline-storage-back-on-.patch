@@ -1,0 +1,41 @@
+From 826688ba766a4ee0fbe1d7565fd3fa26ad659ae0 Mon Sep 17 00:00:00 2001
+From: WWE13 Recomp <wwe13-recomp@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 11:19:18 -0500
+Subject: [PATCH 122/124] vulkan: read the shader and pipeline storage back on
+ macOS / iOS
+
+The storage files are opened "a+b". BSD libc (macOS, iOS) leaves the read position at the end
+of the file, unlike glibc, so the header read failed, every start truncated the files and
+rebuilt every pipeline (348 again on each iPad run). Rewind before reading; writes still append.
+A second iPad run now loads 198 pipelines in 0.2 s and builds 2.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/graphics/vulkan/pipeline_cache.cpp | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/src/graphics/vulkan/pipeline_cache.cpp b/src/graphics/vulkan/pipeline_cache.cpp
+index de78676..4f40bf4 100644
+--- a/src/graphics/vulkan/pipeline_cache.cpp
++++ b/src/graphics/vulkan/pipeline_cache.cpp
+@@ -438,6 +438,9 @@ void VulkanPipelineCache::InitializeShaderStorage(const std::filesystem::path& c
+     return;
+   }
+   pipeline_storage_file_flush_needed_ = false;
++  // "a+" leaves the read position at the end of the file on macOS / iOS (BSD libc; glibc starts
++  // at the beginning), so the stored pipelines were never read back there. Writes still append.
++  rex::filesystem::Seek(pipeline_storage_file_, 0, SEEK_SET);
+   // 'XEPS'.
+   const uint32_t pipeline_storage_magic = 0x53504558;
+   const uint32_t pipeline_storage_magic_api = edram_fragment_shader_interlock ? 1u : 0u;
+@@ -524,6 +527,7 @@ void VulkanPipelineCache::InitializeShaderStorage(const std::filesystem::path& c
+   }
+   ++shader_storage_index_;
+   shader_storage_file_flush_needed_ = false;
++  rex::filesystem::Seek(shader_storage_file_, 0, SEEK_SET);  // See the pipeline file above.
+   struct {
+     uint32_t magic;
+     uint32_t version_swapped;
+-- 
+2.54.0 (Apple Git-157)
+
