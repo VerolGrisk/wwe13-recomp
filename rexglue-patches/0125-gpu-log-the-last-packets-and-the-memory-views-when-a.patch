@@ -1,0 +1,132 @@
+From ac799ba1b6b40f7b1d83a73bcfb1a0457ed46580 Mon Sep 17 00:00:00 2001
+From: WWE13 Recomp <wwe13-recomp@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 08:48:33 -0500
+Subject: [PATCH 125/126] gpu: log the last packets and the memory views when a
+ ring buffer packet fails
+
+When "Failed to execute packet" is reported for the primary or an indirect ring,
+dump the last 16 packet headers read on the GPU command thread, and for the
+primary ring the failing words through the physical and each virtual view of
+guest memory. This tells a reader that derailed after a valid packet from one
+that read memory the guest never wrote. Logged at most a few times per run.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ include/rex/graphics/command_processor.h |  1 +
+ src/graphics/command_processor.cpp       | 69 ++++++++++++++++++++++++
+ 2 files changed, 70 insertions(+)
+
+diff --git a/include/rex/graphics/command_processor.h b/include/rex/graphics/command_processor.h
+index ebe0695..ba25a2f 100644
+--- a/include/rex/graphics/command_processor.h
++++ b/include/rex/graphics/command_processor.h
+@@ -144,6 +144,7 @@ class CommandProcessor {
+   void EnableReadPointerWriteBack(uint32_t ptr, uint32_t block_size_log2);
+ 
+   void UpdateWritePointer(uint32_t value);
++  static void LogPacketHistory(const char* ring);
+ 
+   void ExecutePacket(uint32_t ptr, uint32_t count);
+ 
+diff --git a/src/graphics/command_processor.cpp b/src/graphics/command_processor.cpp
+index e11b747..7f556f9 100644
+--- a/src/graphics/command_processor.cpp
++++ b/src/graphics/command_processor.cpp
+@@ -795,8 +795,38 @@ uint32_t CommandProcessor::ExecutePrimaryBuffer(uint32_t read_index, uint32_t wr
+   reader.set_write_offset(write_index * sizeof(uint32_t));
+   do {
+     if (!ExecutePacket(&reader)) {
++      {  // Diagnostics: compare the failing words through every view of the memory (first 3 failures).
++        static int diag_dumps = 0;
++        if (diag_dumps++ < 3) {
++          const uint32_t fail_off = uint32_t(reader.read_offset()) & ~3u;
++          const uint32_t phys = (primary_buffer_ptr_ & 0x1FFFFFFF) + fail_off;
++          auto words = [&](const uint8_t* p) {
++            std::string out;
++            for (int i = -4; i < 4; ++i) {
++              uint32_t w;
++              std::memcpy(&w, p + i * 4, 4);
++              out += fmt::format(" {:08X}", rex::byte_swap(w));
++            }
++            return out;
++          };
++          REXGPU_ERROR("[rb-diag] base={:08X} size={:#x} read_index={} write_index={} fail_off={:#x} phys={:08X}",
++                       primary_buffer_ptr_, primary_buffer_size_, read_index, write_index, fail_off, phys);
++          REXGPU_ERROR("[rb-diag] physical     :{}", words(memory_->TranslatePhysical(phys)));
++          for (uint32_t view : {0xA0000000u, 0xC0000000u}) {
++            REXGPU_ERROR("[rb-diag] virt {:08X} :{}", view + phys,
++                         words(memory_->TranslateVirtual(view + phys)));
++          }
++          if (phys >= 0x1000) {
++            REXGPU_ERROR("[rb-diag] virt {:08X} :{}", 0xE0000000u + phys - 0x1000,
++                         words(memory_->TranslateVirtual(0xE0000000u + phys - 0x1000)));
++          }
++          REXGPU_ERROR("[rb-diag] physical-4K  :{}", words(memory_->TranslatePhysical(phys - 0x1000)));
++          REXGPU_ERROR("[rb-diag] physical+4K  :{}", words(memory_->TranslatePhysical(phys + 0x1000)));
++        }
++      }
+       // This probably should be fatal - but we're going to continue anyways.
+       REXGPU_ERROR("**** PRIMARY RINGBUFFER: Failed to execute packet.");
++      LogPacketHistory("primary");
+       assert_always();
+       break;
+     }
+@@ -821,6 +851,7 @@ void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
+     if (!ExecutePacket(&reader)) {
+       // Return up a level if we encounter a bad packet.
+       REXGPU_ERROR("**** INDIRECT RINGBUFFER: Failed to execute packet.");
++      LogPacketHistory("indirect");
+       assert_always();
+       break;
+     }
+@@ -842,9 +873,47 @@ void CommandProcessor::ExecutePacket(uint32_t ptr, uint32_t count) {
+   } while (reader.read_count());
+ }
+ 
++namespace {
++// Diagnostics for "Failed to execute packet": the last packet headers the command processor read
++// (GPU command thread only), dumped when a packet fails, to tell a reader that derailed after a
++// valid packet from one that read memory the guest never wrote.
++struct PacketHistoryEntry {
++  uint64_t reader_ptr;
++  uint32_t header;
++};
++thread_local PacketHistoryEntry g_packet_history[16];
++thread_local uint32_t g_packet_history_next = 0;
++}  // namespace
++
++void CommandProcessor::LogPacketHistory(const char* ring) {
++  static std::atomic<int> dumps{0};
++  if (dumps.fetch_add(1) >= 4) {
++    return;
++  }
++  std::string out;
++  for (uint32_t i = 0; i < 16; ++i) {
++    const PacketHistoryEntry& entry = g_packet_history[(g_packet_history_next + i) % 16];
++    if (!entry.reader_ptr) {
++      continue;
++    }
++    const uint32_t type = entry.header >> 30;
++    uint32_t count = 0;
++    if (type == 0) {
++      count = ((entry.header >> 16) & 0x3FFF) + 1;
++    } else if (type == 3) {
++      count = ((entry.header >> 16) & 0x3FFF) + 1;
++    }
++    out += fmt::format(" [{:x}:{:08X} t{} op{:02X} n{}]", entry.reader_ptr & 0xFFFFFFF, entry.header,
++                       type, type == 3 ? ((entry.header >> 8) & 0x7F) : 0, count);
++  }
++  REXGPU_ERROR("[rb-diag] {} ring, last packets (oldest first):{}", ring, out);
++}
++
+ bool CommandProcessor::ExecutePacket(memory::RingBuffer* reader) {
+   const uint32_t packet = reader->ReadAndSwap<uint32_t>();
+   const uint32_t packet_type = packet >> 30;
++  g_packet_history[g_packet_history_next] = {uint64_t(uintptr_t(reader->read_ptr() - 4)), packet};
++  g_packet_history_next = (g_packet_history_next + 1) % 16;
+   if (packet == 0) {
+     trace_writer_.WritePacketStart(uint32_t(reader->read_ptr() - 4), 1);
+     trace_writer_.WritePacketEnd();
+-- 
+2.54.0 (Apple Git-157)
+

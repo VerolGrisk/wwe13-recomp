@@ -1,0 +1,581 @@
+From a1e758a4f5c1cd34dd6344219bce603dfd446730 Mon Sep 17 00:00:00 2001
+From: WWE13 Recomp <wwe13-recomp@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 08:48:33 -0500
+Subject: [PATCH 126/126] vulkan: fewer and smaller render passes for
+ tile-based GPUs
+
+On Apple GPUs (MoltenVK) every render pass loads and stores its attachments,
+and the emulated render targets are up to 4688 rows tall.
+
+- Shared memory uploads that no draw in the current submission has touched are
+  recorded into a prelude that is prepended to the submission, instead of
+  ending the render pass for a copy in the middle of it. The prelude is fenced
+  by barriers at its start and end. Readback copies and Use() mark the pages
+  they touch, so a later upload to them still goes in place.
+  WWE13_UPLOAD_PRELUDE=0 turns this off.
+- Each render pass's render area is trimmed to the union of the scissors and
+  clear rectangles used in it (patched into the deferred begin command when the
+  pass ends). WWE13_RENDER_AREA_TRIM=0 turns this off.
+
+On the Mac attract mode this cut render encoders from 73.9k to 49.8k and copy
+encoders from 60.7k to 8.8k, and passes keep about 65% of the full area. On an
+iPad mini (A20 Pro) a WWE '13 entrance at 720p with 2x MSAA holds 29 fps.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ include/rex/graphics/shared_memory.h          |   5 +
+ .../rex/graphics/vulkan/command_processor.h   |  26 +++++
+ .../graphics/vulkan/deferred_command_buffer.h |  11 ++
+ include/rex/graphics/vulkan/shared_memory.h   |  20 ++++
+ src/graphics/shared_memory.cpp                |   8 +-
+ src/graphics/vulkan/command_processor.cpp     | 106 ++++++++++++++++++
+ .../vulkan/deferred_command_buffer.cpp        |  11 ++
+ src/graphics/vulkan/render_target_cache.cpp   |   1 +
+ src/graphics/vulkan/shared_memory.cpp         |  97 ++++++++++++++--
+ 9 files changed, 276 insertions(+), 9 deletions(-)
+
+diff --git a/include/rex/graphics/shared_memory.h b/include/rex/graphics/shared_memory.h
+index abb870f..f3cb369 100644
+--- a/include/rex/graphics/shared_memory.h
++++ b/include/rex/graphics/shared_memory.h
+@@ -144,6 +144,11 @@ class SharedMemory {
+   // overall bounds of pages to be uploaded.
+   virtual bool UploadRanges(
+       const std::vector<std::pair<uint32_t, uint32_t>>& upload_page_ranges) = 0;
++  // Called after RequestRanges made the (merged, sorted) byte ranges valid: the GPU will read
++  // them in the current submission.
++  virtual void OnRangesRequested(const std::vector<std::pair<uint32_t, uint32_t>>& ranges) {
++    (void)ranges;
++  }
+ 
+   const std::vector<std::pair<uint32_t, uint32_t>>& trace_download_ranges() {
+     return trace_download_ranges_;
+diff --git a/include/rex/graphics/vulkan/command_processor.h b/include/rex/graphics/vulkan/command_processor.h
+index 1ebc02a..9fb226a 100644
+--- a/include/rex/graphics/vulkan/command_processor.h
++++ b/include/rex/graphics/vulkan/command_processor.h
+@@ -163,6 +163,18 @@ class VulkanCommandProcessor : public CommandProcessor {
+   }
+ 
+   bool submission_open() const { return submission_open_; }
++  // Commands executed at the start of the current submission, before everything recorded in
++  // deferred_command_buffer(): shared-memory uploads hoisted out of render passes (on tile-based
++  // GPUs every render pass that is split for a copy stores and reloads its attachments). The
++  // first call records the barrier that orders the copies after all earlier GPU work.
++  DeferredCommandBuffer& upload_prelude_command_buffer();
++
++  // Render area trimming: a render target cache pass covers the whole EDRAM-shaped framebuffer
++  // (up to 8192 rows), but tile-based GPUs load and store every tile of the render area, so each
++  // pass's area is cut down, when it ends, to the extent its draws (scissors) and clears touched.
++  // All attachments load and store, so pixels outside the area keep their contents.
++  // WWE13_RENDER_AREA_TRIM=0 disables it.
++  void ExtendRenderArea(const VkRect2D& rect);
+   uint64_t GetCurrentSubmission() const {
+     return submission_completed_ + uint64_t(submissions_in_flight_fences_.size()) + 1;
+   }
+@@ -634,6 +646,20 @@ class VulkanCommandProcessor : public CommandProcessor {
+   std::vector<CommandBuffer> command_buffers_writable_;
+   std::deque<std::pair<uint64_t, CommandBuffer>> command_buffers_submitted_;
+   DeferredCommandBuffer deferred_command_buffer_;
++  DeferredCommandBuffer upload_prelude_command_buffer_;
++  bool upload_prelude_used_ = false;
++
++  void OnRenderPassBegun(bool is_rendering, VkExtent2D full_extent);
++  void OnRenderPassEnding();
++  size_t render_area_arguments_offset_ = SIZE_MAX;
++  bool render_area_is_rendering_ = false;
++  VkExtent2D render_area_full_extent_ = {};
++  uint32_t render_area_used_width_ = 0;
++  uint32_t render_area_used_height_ = 0;
++  int render_area_trim_ = -1;  // -1: not read from the environment yet.
++  uint64_t render_area_passes_ = 0;
++  uint64_t render_area_full_pixels_ = 0;
++  uint64_t render_area_trimmed_pixels_ = 0;
+   std::unique_ptr<GpuTiming> gpu_timing_;
+ 
+   static constexpr size_t kSubmissionWorkerDeferredCommandBufferCount = 3;
+diff --git a/include/rex/graphics/vulkan/deferred_command_buffer.h b/include/rex/graphics/vulkan/deferred_command_buffer.h
+index cf3df6b..8a57a84 100644
+--- a/include/rex/graphics/vulkan/deferred_command_buffer.h
++++ b/include/rex/graphics/vulkan/deferred_command_buffer.h
+@@ -31,6 +31,16 @@ class DeferredCommandBuffer {
+ 
+   void Reset();
+   void SwapStorage(DeferredCommandBuffer& other) { command_stream_.swap(other.command_stream_); }
++  bool empty() const { return command_stream_.empty(); }
++  // Offset (in stream elements) of the arguments of the most recently written command.
++  size_t last_command_arguments_offset() const { return last_command_arguments_offset_; }
++  // Changes the render area extent of a recorded vkCmdBeginRendering / vkCmdBeginRenderPass.
++  void PatchRenderAreaExtent(size_t arguments_offset, bool is_rendering, VkExtent2D extent);
++  // Puts the commands of `prelude` before this buffer's commands.
++  void Prepend(const DeferredCommandBuffer& prelude) {
++    command_stream_.insert(command_stream_.begin(), prelude.command_stream_.begin(),
++                           prelude.command_stream_.end());
++  }
+   void Execute(VkCommandBuffer command_buffer, uint64_t frame, uint64_t submission);
+ 
+   void CmdGpuTimingCategory(GpuTimingCategory category) {
+@@ -596,6 +606,7 @@ class DeferredCommandBuffer {
+ 
+   // uintmax_t to ensure uint64_t and pointer alignment of all structures.
+   std::vector<uintmax_t> command_stream_;
++  size_t last_command_arguments_offset_ = 0;
+ };
+ 
+ }  // namespace rex::graphics::vulkan
+diff --git a/include/rex/graphics/vulkan/shared_memory.h b/include/rex/graphics/vulkan/shared_memory.h
+index 8c3f93f..aab15e0 100644
+--- a/include/rex/graphics/vulkan/shared_memory.h
++++ b/include/rex/graphics/vulkan/shared_memory.h
+@@ -49,6 +49,11 @@ class VulkanSharedMemory : public SharedMemory {
+   void Use(Usage usage, std::pair<uint32_t, uint32_t> written_range = {});
+ 
+   VkBuffer buffer() const { return buffer_; }
++  // Records a GPU access to a byte range in the current submission outside RequestRange (for
++  // example readbacks), so uploads of those pages are not moved before it.
++  void MarkGpuAccess(uint32_t start_bytes, uint32_t length_bytes) {
++    MarkPagesTouched(start_bytes, length_bytes);
++  }
+ 
+   // Returns true if any downloads were submitted to the command processor.
+   bool InitializeTraceSubmitDownloads();
+@@ -59,6 +64,7 @@ class VulkanSharedMemory : public SharedMemory {
+                                         uint32_t length_allocations) override;
+ 
+   bool UploadRanges(const std::vector<std::pair<uint32_t, uint32_t>>& upload_page_ranges) override;
++  void OnRangesRequested(const std::vector<std::pair<uint32_t, uint32_t>>& ranges) override;
+ 
+  private:
+   void GetUsageMasks(Usage usage, VkPipelineStageFlags& stage_mask,
+@@ -79,6 +85,20 @@ class VulkanSharedMemory : public SharedMemory {
+   std::unique_ptr<ui::vulkan::VulkanUploadBufferPool> upload_buffer_pool_;
+   std::vector<VkBufferCopy> upload_regions_;
+ 
++  // Pages the GPU reads or writes in the current submission (bit per shared-memory page). An
++  // upload that touches none of them can run at the start of the submission (the upload prelude)
++  // instead of splitting the render pass; any overlap keeps the in-place copy, which is ordered
++  // between the earlier and later accesses. WWE13_UPLOAD_PRELUDE=0 disables hoisting.
++  void MarkPagesTouched(uint32_t start_bytes, uint32_t length_bytes);
++  bool ArePagesTouched(uint32_t page_first, uint32_t page_count);
++  void ResetTouchedPagesIfNewSubmission();
++  std::vector<uint64_t> touched_pages_;
++  std::vector<uint32_t> touched_blocks_;  // Indices of non-zero words in touched_pages_.
++  uint64_t touched_submission_ = 0;
++  bool upload_prelude_enabled_ = true;
++  uint64_t uploads_hoisted_ = 0;
++  uint64_t uploads_in_place_ = 0;
++
+   // Created temporarily, only for downloading.
+   VkBuffer trace_download_buffer_ = VK_NULL_HANDLE;
+   VkDeviceMemory trace_download_buffer_memory_ = VK_NULL_HANDLE;
+diff --git a/src/graphics/shared_memory.cpp b/src/graphics/shared_memory.cpp
+index 2b5b4db..d42e3d3 100644
+--- a/src/graphics/shared_memory.cpp
++++ b/src/graphics/shared_memory.cpp
+@@ -516,6 +516,7 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
+       COUNT_profile_set("gpu/shared_memory/request_ranges_merged_count",
+                         uint32_t(merged_ranges.size()));
+       COUNT_profile_set("gpu/shared_memory/request_ranges_upload_count", 0);
++      OnRangesRequested(merged_ranges);
+       return true;
+     }
+   }
+@@ -594,10 +595,15 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
+                     uint32_t(upload_ranges_.size()));
+ 
+   if (upload_ranges_.empty()) {
++    OnRangesRequested(merged_ranges);
+     return true;
+   }
+ 
+-  return UploadRanges(upload_ranges_);
++  if (!UploadRanges(upload_ranges_)) {
++    return false;
++  }
++  OnRangesRequested(merged_ranges);
++  return true;
+ }
+ 
+ bool SharedMemory::RequestRange(uint32_t start, uint32_t length) {
+diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
+index b8e8c44..6286f35 100644
+--- a/src/graphics/vulkan/command_processor.cpp
++++ b/src/graphics/vulkan/command_processor.cpp
+@@ -927,6 +927,7 @@ VulkanCommandProcessor::VulkanCommandProcessor(VulkanGraphicsSystem* graphics_sy
+                                                system::KernelState* kernel_state)
+     : CommandProcessor(graphics_system, kernel_state),
+       deferred_command_buffer_(*this),
++      upload_prelude_command_buffer_(*this, 64 * 1024),
+       transient_descriptor_allocator_uniform_buffer_(
+           static_cast<const ui::vulkan::VulkanProvider*>(graphics_system->provider())
+               ->vulkan_device(),
+@@ -1032,6 +1033,77 @@ void VulkanCommandProcessor::ReturnSubmissionWorkerCommandBuffer(
+   submission_worker_condition_.notify_all();
+ }
+ 
++void VulkanCommandProcessor::OnRenderPassBegun(bool is_rendering, VkExtent2D full_extent) {
++  if (render_area_trim_ < 0) {
++    const char* value = std::getenv("WWE13_RENDER_AREA_TRIM");
++    render_area_trim_ = (value && std::string_view(value) == "0") ? 0 : 1;
++    REXGPU_INFO("Render area trimming is {}",
++                render_area_trim_ ? "on" : "off (WWE13_RENDER_AREA_TRIM=0)");
++  }
++  render_area_arguments_offset_ = deferred_command_buffer_.last_command_arguments_offset();
++  render_area_is_rendering_ = is_rendering;
++  render_area_full_extent_ = full_extent;
++  render_area_used_width_ = 0;
++  render_area_used_height_ = 0;
++  if (!dynamic_scissor_update_needed_) {
++    // The scissor already set in this command buffer applies to the first draws.
++    ExtendRenderArea(dynamic_scissor_);
++  }
++}
++
++void VulkanCommandProcessor::ExtendRenderArea(const VkRect2D& rect) {
++  if (!in_render_pass_ || render_area_arguments_offset_ == SIZE_MAX) {
++    return;
++  }
++  const uint32_t right = uint32_t(std::max(rect.offset.x, 0)) + rect.extent.width;
++  const uint32_t bottom = uint32_t(std::max(rect.offset.y, 0)) + rect.extent.height;
++  render_area_used_width_ = std::max(render_area_used_width_, right);
++  render_area_used_height_ = std::max(render_area_used_height_, bottom);
++}
++
++void VulkanCommandProcessor::OnRenderPassEnding() {
++  if (render_area_arguments_offset_ == SIZE_MAX) {
++    return;
++  }
++  const VkExtent2D full = render_area_full_extent_;
++  VkExtent2D trimmed;
++  trimmed.width = std::clamp(render_area_used_width_, uint32_t(1), full.width);
++  trimmed.height = std::clamp(render_area_used_height_, uint32_t(1), full.height);
++  ++render_area_passes_;
++  render_area_full_pixels_ += uint64_t(full.width) * full.height;
++  render_area_trimmed_pixels_ += uint64_t(trimmed.width) * trimmed.height;
++  if (render_area_passes_ % 50000 == 0) {
++    REXGPU_INFO("Render area trimming: {} passes, {:.1f}% of the full render area kept",
++                render_area_passes_,
++                render_area_full_pixels_
++                    ? 100.0 * double(render_area_trimmed_pixels_) / double(render_area_full_pixels_)
++                    : 100.0);
++  }
++  if (render_area_trim_ > 0 &&
++      (trimmed.width != full.width || trimmed.height != full.height)) {
++    deferred_command_buffer_.PatchRenderAreaExtent(render_area_arguments_offset_,
++                                                   render_area_is_rendering_, trimmed);
++  }
++  render_area_arguments_offset_ = SIZE_MAX;
++}
++
++DeferredCommandBuffer& VulkanCommandProcessor::upload_prelude_command_buffer() {
++  assert_true(submission_open_);
++  if (!upload_prelude_used_) {
++    upload_prelude_used_ = true;
++    // Order the copies after all earlier work on the queue (previous submissions that may still
++    // read or write the shared memory).
++    VkMemoryBarrier prelude_begin_barrier = {};
++    prelude_begin_barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
++    prelude_begin_barrier.srcAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
++    prelude_begin_barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
++    upload_prelude_command_buffer_.CmdVkPipelineBarrier(
++        VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1,
++        &prelude_begin_barrier, 0, nullptr, 0, nullptr);
++  }
++  return upload_prelude_command_buffer_;
++}
++
+ void VulkanCommandProcessor::SetGpuTimingCategory(GpuTimingCategory category) {
+   if (gpu_timing_ && gpu_timing_->enabled() && submission_open_) {
+     deferred_command_buffer_.CmdGpuTimingCategory(category);
+@@ -3896,6 +3968,7 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
+   }
+ 
+   if (in_render_pass_) {
++    OnRenderPassEnding();
+     if (use_dynamic_rendering) {
+       deferred_command_buffer_.CmdVkEndRendering();
+     } else {
+@@ -3931,6 +4004,8 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
+     rendering_info.pDepthAttachment = has_depth ? &depth_attachment : nullptr;
+     rendering_info.pStencilAttachment = has_stencil ? &stencil_attachment : nullptr;
+     deferred_command_buffer_.CmdVkBeginRendering(&rendering_info);
++    in_render_pass_ = true;
++    OnRenderPassBegun(true, rendering_info.renderArea.extent);
+   } else {
+     VkRenderPassBeginInfo render_pass_begin_info;
+     render_pass_begin_info.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+@@ -3946,6 +4021,8 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
+     render_pass_begin_info.pClearValues = nullptr;
+     deferred_command_buffer_.CmdVkBeginRenderPass(&render_pass_begin_info,
+                                                   VK_SUBPASS_CONTENTS_INLINE);
++    in_render_pass_ = true;
++    OnRenderPassBegun(false, render_pass_begin_info.renderArea.extent);
+   }
+   in_render_pass_ = true;
+ }
+@@ -3970,6 +4047,7 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
+   }
+ 
+   if (in_render_pass_) {
++    OnRenderPassEnding();
+     if (use_dynamic_rendering) {
+       deferred_command_buffer_.CmdVkEndRendering();
+     } else {
+@@ -4025,6 +4103,8 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
+     rendering_info.pDepthAttachment = transfer_dest_is_depth ? &depth_attachment : nullptr;
+     rendering_info.pStencilAttachment = transfer_dest_is_depth ? &stencil_attachment : nullptr;
+     deferred_command_buffer_.CmdVkBeginRendering(&rendering_info);
++    in_render_pass_ = true;
++    OnRenderPassBegun(true, rendering_info.renderArea.extent);
+   } else {
+     VkRenderPassBeginInfo render_pass_begin_info;
+     render_pass_begin_info.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+@@ -4038,6 +4118,8 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
+     render_pass_begin_info.pClearValues = nullptr;
+     deferred_command_buffer_.CmdVkBeginRenderPass(&render_pass_begin_info,
+                                                   VK_SUBPASS_CONTENTS_INLINE);
++    in_render_pass_ = true;
++    OnRenderPassBegun(false, render_pass_begin_info.renderArea.extent);
+   }
+   in_render_pass_ = true;
+ }
+@@ -4047,6 +4129,7 @@ void VulkanCommandProcessor::EndRenderPass() {
+   if (!in_render_pass_) {
+     return;
+   }
++  OnRenderPassEnding();
+   if (current_render_pass_ == VK_NULL_HANDLE) {
+     deferred_command_buffer_.CmdVkEndRendering();
+   } else {
+@@ -4351,6 +4434,7 @@ void VulkanCommandProcessor::SetViewport(const VkViewport& viewport) {
+ }
+ 
+ void VulkanCommandProcessor::SetScissor(const VkRect2D& scissor) {
++  ExtendRenderArea(scissor);
+   if (!dynamic_scissor_update_needed_) {
+     dynamic_scissor_update_needed_ |= dynamic_scissor_.offset.x != scissor.offset.x;
+     dynamic_scissor_update_needed_ |= dynamic_scissor_.offset.y != scissor.offset.y;
+@@ -5971,6 +6055,7 @@ bool VulkanCommandProcessor::ReadbackScaledGpuWrittenRanges(
+         copy.srcOffset = job.transfer_address;
+         copy.dstOffset = job.readback_offset;
+         copy.size = job.transfer_length;
++        shared_memory_->MarkGpuAccess(job.transfer_address, job.transfer_length);
+         deferred_command_buffer_.CmdVkCopyBuffer(shared_memory_->buffer(), readback_buffer, 1,
+                                                 &copy);
+         continue;
+@@ -6172,6 +6257,7 @@ bool VulkanCommandProcessor::ReadbackGpuWrittenRange(uint32_t physical_address,
+       region.srcOffset = run.first;
+       region.dstOffset = offset;
+       region.size = run.second;
++      shared_memory_->MarkGpuAccess(run.first, run.second);
+       deferred_command_buffer_.CmdVkCopyBuffer(shared_memory_->buffer(), buffer, 1, &region);
+       offset += run.second;
+     }
+@@ -6731,6 +6817,8 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
+     // the end of the submission (when async pipeline object creation requests
+     // are fulfilled).
+     deferred_command_buffer_.Reset();
++    upload_prelude_command_buffer_.Reset();
++    upload_prelude_used_ = false;
+ 
+     // Reset cached state of the command buffer.
+     dynamic_viewport_update_needed_ = true;
+@@ -6924,6 +7012,18 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
+ 
+     uniform_buffer_pool_->FlushWrites();
+ 
++    if (upload_prelude_used_) {
++      // The hoisted copies must be visible to everything after them in this submission.
++      VkMemoryBarrier prelude_end_barrier = {};
++      prelude_end_barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
++      prelude_end_barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
++      prelude_end_barrier.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
++      upload_prelude_command_buffer_.CmdVkPipelineBarrier(
++          VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1,
++          &prelude_end_barrier, 0, nullptr, 0, nullptr);
++      sparse_bind_wait_stage_mask_ |= VK_PIPELINE_STAGE_TRANSFER_BIT;
++    }
++
+     // Submit sparse binds earlier, before executing the deferred command
+     // buffer, to reduce latency.
+     if (!sparse_memory_binds_.empty()) {
+@@ -6983,6 +7083,12 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
+ 
+     SubmitBarriers(true);
+ 
++    if (upload_prelude_used_) {
++      deferred_command_buffer_.Prepend(upload_prelude_command_buffer_);
++      upload_prelude_command_buffer_.Reset();
++      upload_prelude_used_ = false;
++    }
++
+     assert_false(command_buffers_writable_.empty());
+     CommandBuffer command_buffer = command_buffers_writable_.back();
+     if (async_submission_enabled_ && !is_swap) {
+diff --git a/src/graphics/vulkan/deferred_command_buffer.cpp b/src/graphics/vulkan/deferred_command_buffer.cpp
+index 127984f..3b9f98a 100644
+--- a/src/graphics/vulkan/deferred_command_buffer.cpp
++++ b/src/graphics/vulkan/deferred_command_buffer.cpp
+@@ -430,7 +430,18 @@ void* DeferredCommandBuffer::WriteCommand(Command command, size_t arguments_size
+   CommandHeader& header = *reinterpret_cast<CommandHeader*>(command_stream_.data() + offset);
+   header.command = command;
+   header.arguments_size_elements = uint32_t(arguments_size_elements);
++  last_command_arguments_offset_ = offset + kCommandHeaderSizeElements;
+   return command_stream_.data() + (offset + kCommandHeaderSizeElements);
+ }
+ 
++void DeferredCommandBuffer::PatchRenderAreaExtent(size_t arguments_offset, bool is_rendering,
++                                                  VkExtent2D extent) {
++  uintmax_t* arguments = command_stream_.data() + arguments_offset;
++  if (is_rendering) {
++    reinterpret_cast<ArgsVkBeginRendering*>(arguments)->render_area.extent = extent;
++  } else {
++    reinterpret_cast<ArgsVkBeginRenderPass*>(arguments)->render_area.extent = extent;
++  }
++}
++
+ }  // namespace rex::graphics::vulkan
+diff --git a/src/graphics/vulkan/render_target_cache.cpp b/src/graphics/vulkan/render_target_cache.cpp
+index 45778a9..419a21d 100644
+--- a/src/graphics/vulkan/render_target_cache.cpp
++++ b/src/graphics/vulkan/render_target_cache.cpp
+@@ -5775,6 +5775,7 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
+           } break;
+         }
+       }
++      command_processor_.ExtendRenderArea(resolve_clear_rect.rect);
+       command_buffer.CmdVkClearAttachments(1, &resolve_clear_attachment, 1, &resolve_clear_rect);
+     }
+   }
+diff --git a/src/graphics/vulkan/shared_memory.cpp b/src/graphics/vulkan/shared_memory.cpp
+index 69ec35d..175c1da 100644
+--- a/src/graphics/vulkan/shared_memory.cpp
++++ b/src/graphics/vulkan/shared_memory.cpp
+@@ -9,6 +9,8 @@
+  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+  */
+ 
++#include <string_view>
++#include <cstdlib>
+ #include <algorithm>
+ #include <cstring>
+ #include <utility>
+@@ -205,6 +207,9 @@ void VulkanSharedMemory::EndSubmission() {
+ void VulkanSharedMemory::Use(Usage usage, std::pair<uint32_t, uint32_t> written_range) {
+   written_range.first = std::min(written_range.first, kBufferSize);
+   written_range.second = std::min(written_range.second, kBufferSize - written_range.first);
++  if (written_range.second) {
++    MarkPagesTouched(written_range.first, written_range.second);
++  }
+   assert_true(usage != Usage::kRead || !written_range.second);
+   if (last_usage_ != usage || last_written_range_.second) {
+     VkPipelineStageFlags src_stage_mask, dst_stage_mask;
+@@ -343,21 +348,97 @@ bool VulkanSharedMemory::AllocateSparseHostGpuMemoryRange(uint32_t offset_alloca
+   return true;
+ }
+ 
++void VulkanSharedMemory::ResetTouchedPagesIfNewSubmission() {
++  const uint64_t submission = command_processor_.GetCurrentSubmission();
++  if (submission == touched_submission_) {
++    return;
++  }
++  touched_submission_ = submission;
++  if (touched_pages_.empty()) {
++    touched_pages_.assign(((kBufferSize >> page_size_log2()) + 63) / 64, 0);
++    const char* value = std::getenv("WWE13_UPLOAD_PRELUDE");
++    upload_prelude_enabled_ = !(value && std::string_view(value) == "0");
++    REXGPU_INFO("Shared memory: hoisting uploads out of render passes is {}",
++                upload_prelude_enabled_ ? "on" : "off (WWE13_UPLOAD_PRELUDE=0)");
++  }
++  for (uint32_t block : touched_blocks_) {
++    touched_pages_[block] = 0;
++  }
++  touched_blocks_.clear();
++}
++
++void VulkanSharedMemory::MarkPagesTouched(uint32_t start_bytes, uint32_t length_bytes) {
++  if (!length_bytes) {
++    return;
++  }
++  ResetTouchedPagesIfNewSubmission();
++  const uint32_t page_first = start_bytes >> page_size_log2();
++  const uint32_t page_last = (start_bytes + length_bytes - 1) >> page_size_log2();
++  for (uint32_t page = page_first; page <= page_last;) {
++    const uint32_t block = page >> 6;
++    const uint32_t bit = page & 63;
++    const uint32_t bits = std::min(64 - bit, page_last - page + 1);
++    const uint64_t mask = (bits == 64 ? ~uint64_t(0) : ((uint64_t(1) << bits) - 1)) << bit;
++    if (!touched_pages_[block]) {
++      touched_blocks_.push_back(block);
++    }
++    touched_pages_[block] |= mask;
++    page += bits;
++  }
++}
++
++bool VulkanSharedMemory::ArePagesTouched(uint32_t page_first, uint32_t page_count) {
++  ResetTouchedPagesIfNewSubmission();
++  const uint32_t page_last = page_first + page_count - 1;
++  for (uint32_t page = page_first; page <= page_last;) {
++    const uint32_t block = page >> 6;
++    const uint32_t bit = page & 63;
++    const uint32_t bits = std::min(64 - bit, page_last - page + 1);
++    const uint64_t mask = (bits == 64 ? ~uint64_t(0) : ((uint64_t(1) << bits) - 1)) << bit;
++    if (touched_pages_[block] & mask) {
++      return true;
++    }
++    page += bits;
++  }
++  return false;
++}
++
++void VulkanSharedMemory::OnRangesRequested(
++    const std::vector<std::pair<uint32_t, uint32_t>>& ranges) {
++  for (const auto& range : ranges) {
++    MarkPagesTouched(range.first, range.second);
++  }
++}
++
+ bool VulkanSharedMemory::UploadRanges(
+     const std::vector<std::pair<uint32_t, uint32_t>>& upload_page_ranges) {
+   if (upload_page_ranges.empty()) {
+     return true;
+   }
+-  command_processor_.SetGpuTimingCategory(GpuTimingCategory::kSharedMemoryUploadCopy);
++  ResetTouchedPagesIfNewSubmission();
++  bool hoist = upload_prelude_enabled_ && command_processor_.submission_open();
++  for (size_t i = 0; hoist && i < upload_page_ranges.size(); ++i) {
++    hoist = !ArePagesTouched(upload_page_ranges[i].first, upload_page_ranges[i].second);
++  }
++  ++(hoist ? uploads_hoisted_ : uploads_in_place_);
++  if ((uploads_hoisted_ + uploads_in_place_) % 20000 == 0) {
++    REXGPU_INFO("Shared memory: uploads hoisted to the submission start {}, in place {}",
++                uploads_hoisted_, uploads_in_place_);
++  }
++  if (!hoist) {
++    command_processor_.SetGpuTimingCategory(GpuTimingCategory::kSharedMemoryUploadCopy);
+   // upload_page_ranges are sorted, use them to determine the range for the
+   // ordering barrier.
+-  Use(Usage::kTransferDestination,
+-      std::make_pair(upload_page_ranges.front().first << page_size_log2(),
+-                     (upload_page_ranges.back().first + upload_page_ranges.back().second -
+-                      upload_page_ranges.front().first)
+-                         << page_size_log2()));
+-  command_processor_.SubmitBarriers(true);
+-  DeferredCommandBuffer& command_buffer = command_processor_.deferred_command_buffer();
++    Use(Usage::kTransferDestination,
++        std::make_pair(upload_page_ranges.front().first << page_size_log2(),
++                       (upload_page_ranges.back().first + upload_page_ranges.back().second -
++                        upload_page_ranges.front().first)
++                           << page_size_log2()));
++    command_processor_.SubmitBarriers(true);
++  }
++  DeferredCommandBuffer& command_buffer = hoist
++                                              ? command_processor_.upload_prelude_command_buffer()
++                                              : command_processor_.deferred_command_buffer();
+   uint64_t submission_current = command_processor_.GetCurrentSubmission();
+   bool successful = true;
+   upload_regions_.clear();
+-- 
+2.54.0 (Apple Git-157)
+

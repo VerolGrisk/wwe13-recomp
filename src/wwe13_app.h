@@ -75,11 +75,12 @@ class Wwe13App : public rex::ReXApp {
     // itself is read-only).
     if (const char* documents = SDL_GetUserFolder(SDL_FOLDER_DOCUMENTS)) {
       const std::filesystem::path documents_path(documents);
-      // iPad defaults: 2x MSAA and a 1024x576 scene keep entrances at the game's 30 fps on an
-      // A20 Pro (at the game's own 720p / 4x the GPU falls ~100 ms behind there). Lines in
-      // wwe13-env.txt override them (WWE13_INTERNAL_RES=720, WWE13_SCENE_AA=4x for the game's).
+      // iPad default: the game's 720p scene with 2x MSAA holds entrances at the game's 30 fps on
+      // an A20 Pro (with the game's own 4x the GPU falls ~100 ms behind there). Lines in
+      // wwe13-env.txt override it (WWE13_SCENE_AA=4x for the game's, WWE13_INTERNAL_RES=576 for
+      // a lighter scene).
       setenv("WWE13_SCENE_AA", "2x", 0);
-      setenv("WWE13_INTERNAL_RES", "576", 0);
+      setenv("WWE13_INTERNAL_RES", "720", 0);
       ApplyEnvironmentFile(documents_path / "wwe13-env.txt");
       if (!GetArgument("game_directory")) {
         paths.game_data_root = documents_path / "WWE 13";
